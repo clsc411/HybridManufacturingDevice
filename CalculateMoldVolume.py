@@ -1,15 +1,20 @@
 """
 CalculateMoldVolume.py
-Usage: python CalculateMoldVolume.py <path_to_mold.stl>
 
-Computes the cavity volume from a mold STL using:
+Usage (automatic — STL provided):
+    python CalculateMoldVolume.py <path_to_mold.stl>
+    Computes cavity volume from the mold geometry and sends it to the Arduino.
+
+Usage (manual — no STL):
+    python CalculateMoldVolume.py
+    Prompts the operator to enter the dispense volume directly.
+
+Cavity volume method (automatic mode):
     cavity volume = convex hull volume - mold solid volume
+    Works for any mold geometry — rectangular outer walls OR conformal walls.
+    Sprues, gates, and vents are automatically included.
 
-Works for any mold geometry — rectangular outer walls OR conformal walls that
-follow the part shape. Interior cavity complexity does not matter.
-Sprues, gates, and vents are automatically included in the cavity volume.
-
-Sends the computed target volume to the Arduino over serial.
+Sends the computed or entered volume to the Arduino over serial.
 The printer trigger on D8 fires the actual dispense — run this before starting the print.
 """
 
@@ -100,23 +105,43 @@ def send_volume_to_arduino(port, baud, target_ml):
     print(f"Arduino confirmed: TARGET_TOTAL_ML set to {target_ml:.2f} mL")
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python CalculateMoldVolume.py <mold.stl>")
-        sys.exit(1)
-
-    mold_stl_path = sys.argv[1]
-
+def get_target_ml_from_stl(mold_stl_path):
+    """Automatic mode: compute target volume from mold STL geometry."""
     print(f"Loading mold STL: {mold_stl_path}")
-    cavity_ml, bbox_ml, solid_ml = compute_cavity_volume_ml(mold_stl_path)
+    cavity_ml, outer_ml, solid_ml = compute_cavity_volume_ml(mold_stl_path)
     target_ml = cavity_ml * (1 + OVERFILL) + DEAD_ML
 
-    print(f"\nOuter hull volume:   {bbox_ml:.2f} mL  (convex envelope of mold surface)")
+    print(f"\nOuter hull volume:   {outer_ml:.2f} mL  (convex envelope of mold surface)")
     print(f"Mold solid volume:   {solid_ml:.2f} mL  (printed plastic walls)")
     print(f"Cavity volume:       {cavity_ml:.2f} mL  (space to fill with resin)")
     print(f"Overfill ({OVERFILL*100:.0f}%):      {cavity_ml * OVERFILL:.2f} mL")
     print(f"Dead volume:         {DEAD_ML:.2f} mL  (mixer + tubing)")
     print(f"Target to dispense:  {target_ml:.2f} mL")
+    return target_ml
+
+
+def get_target_ml_manual():
+    """Manual mode: prompt operator to enter volume directly."""
+    print("No STL file provided — manual volume entry mode.")
+    print("(To use automatic mode, run: python CalculateMoldVolume.py <mold.stl>)\n")
+    while True:
+        try:
+            raw = input("Enter target dispense volume in mL: ").strip()
+            target_ml = float(raw)
+            if target_ml <= 0:
+                print("Volume must be greater than 0. Try again.")
+                continue
+            print(f"Target to dispense:  {target_ml:.2f} mL")
+            return target_ml
+        except ValueError:
+            print("Invalid input — enter a number (e.g. 85.5). Try again.")
+
+
+def main():
+    if len(sys.argv) >= 2:
+        target_ml = get_target_ml_from_stl(sys.argv[1])
+    else:
+        target_ml = get_target_ml_manual()
 
     send_volume_to_arduino(PORT, BAUD, target_ml)
 
