@@ -14,9 +14,8 @@
     D3 -> fully extended end stop
     D5 -> fully retracted end stop (home position)
 
-  E-STOP (NC contact, wired to GND):
-    D9 -> NC button between pin and GND. LOW = normal, HIGH = e-stop active.
-          Safe-fail: a broken wire also triggers e-stop.
+  E-STOP: wired directly to PSU / driver power path (hardware-only).
+          No Arduino pin needed. Cutting power stops the driver immediately.
 
   STATUS LED:
     D13 -> built-in LED. IDLE=off, POURING=solid on, DONE=off, ABORTED=rapid blink.
@@ -26,8 +25,8 @@
     - Converts travel to motor steps using leadscrew lead + microsteps
     - Supports interval pours: pour SEGMENT_ML, wait WAIT_BETWEEN_S, repeat
     - Optional anti-drip retract at end
-    - Checks E-stop and limit switches on every step pulse
-    - E-stop or limit hit: driver disabled, system locked until RESET
+    - Checks limit switches on every step pulse
+    - Unexpected limit hit during dispense: driver disabled, system locked until RESET
 
   CHANGE THESE DEFAULTS to match hardware:
     - MICROSTEPS must match DM806i DIP switch setting
@@ -44,7 +43,6 @@ const uint8_t PIN_EN        = 7;   // ENA+
 const uint8_t PIN_TRIGGER   = 8;   // start signal from printer (HIGH = start)
 const uint8_t PIN_LIMIT_EXT = 3;   // D3 - fully extended end stop (NO to GND)
 const uint8_t PIN_LIMIT_RET = 5;   // D5 - fully retracted / home end stop (NO to GND)
-const uint8_t PIN_ESTOP     = 9;   // D9 - E-stop NC button (HIGH = e-stop active)
 const uint8_t PIN_LED       = 13;  // built-in LED - state indicator
 
 // ---------------- MOTION / MECH PARAMS ----------------
@@ -166,30 +164,26 @@ void stepOnce(unsigned long stepIntervalUs) {
 }
 
 // Move steps in given direction.
-// Checks E-stop and limit switches on every step.
+// Checks limit switches on every step — UC-05-FR2: hard stop within 1 step.
+// An unexpected limit hit sets ABORTED state (requires RESET to resume).
 // Returns true if all steps completed, false if interrupted.
-// UC-04-FR3, UC-05-FR2: hard stop within 1 step of trigger.
 bool moveSteps(long steps, bool dispenseDir) {
   digitalWrite(PIN_DIR, dispenseDir ? DIR_DISPENSE_LEVEL : !DIR_DISPENSE_LEVEL);
   unsigned long dt = stepIntervalUsFromRPM(MOTOR_RPM);
 
   for (long i = 0; i < steps; i++) {
-    // E-stop check (NC wiring: HIGH = e-stop active) — UC-04-FR3
-    if (digitalRead(PIN_ESTOP) == HIGH) {
-      setEnable(false);
-      setState(STATE_ABORTED);
-      return false;
-    }
     // Extended limit: only checked when dispensing — UC-05-FR2
     if (dispenseDir && digitalRead(PIN_LIMIT_EXT) == LOW) {
       setEnable(false);
-      Serial.println(F("LIMIT: extend end-stop triggered. Motion stopped."));
+      setState(STATE_ABORTED);
+      Serial.println(F("LIMIT: extend end-stop triggered. Send RESET to resume."));
       return false;
     }
     // Retract limit: only checked when retracting — UC-05-FR2
     if (!dispenseDir && digitalRead(PIN_LIMIT_RET) == LOW) {
       setEnable(false);
-      Serial.println(F("LIMIT: retract end-stop triggered. Motion stopped."));
+      setState(STATE_ABORTED);
+      Serial.println(F("LIMIT: retract end-stop triggered. Send RESET to resume."));
       return false;
     }
     stepOnce(dt);
@@ -210,11 +204,6 @@ void homeRetract() {
   unsigned long dt = stepIntervalUsFromRPM(MOTOR_RPM);
 
   while (digitalRead(PIN_LIMIT_RET) == HIGH) {
-    if (digitalRead(PIN_ESTOP) == HIGH) {
-      setEnable(false);
-      setState(STATE_ABORTED);
-      return;
-    }
     stepOnce(dt);
   }
   setEnable(false);
@@ -265,18 +254,10 @@ void dispenseTotalMl(float totalMl) {
 
     remaining -= thisSeg;
 
-    // Between-segment wait — checks E-stop every 100 ms so it can respond
     if (remaining > 0.0001f && WAIT_BETWEEN_S > 0) {
       Serial.print(F(" Waiting ")); Serial.print(WAIT_BETWEEN_S);
       Serial.println(F(" s before next segment..."));
-      unsigned long waitEnd = millis() + WAIT_BETWEEN_S * 1000UL;
-      while (millis() < waitEnd && !g_aborted) {
-        if (digitalRead(PIN_ESTOP) == HIGH) {
-          setEnable(false);
-          setState(STATE_ABORTED);
-        }
-        delay(100);
-      }
+      delay(WAIT_BETWEEN_S * 1000UL);
     }
   }
 
@@ -354,7 +335,6 @@ void handleSerial() {
     Serial.print(F("VOLUME_IS_TOTAL_MIXED=")); Serial.println(VOLUME_IS_TOTAL_MIXED ? "true" : "false");
     Serial.print(F("LIMIT_EXT(D3)="));     Serial.println(digitalRead(PIN_LIMIT_EXT) == LOW ? "TRIGGERED" : "open");
     Serial.print(F("LIMIT_RET(D5)="));     Serial.println(digitalRead(PIN_LIMIT_RET) == LOW ? "TRIGGERED" : "open");
-    Serial.print(F("ESTOP(D9)="));         Serial.println(digitalRead(PIN_ESTOP) == HIGH ? "ACTIVE" : "ok");
     Serial.println(F("----------------"));
   } else {
     Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, GO, HOME, PURGE <ml>, RESET"));
@@ -385,7 +365,6 @@ void setup() {
   pinMode(PIN_TRIGGER,   INPUT);           // external level shifter holds line LOW when idle
   pinMode(PIN_LIMIT_EXT, INPUT_PULLUP);    // NO switch to GND: HIGH=open, LOW=triggered
   pinMode(PIN_LIMIT_RET, INPUT_PULLUP);    // NO switch to GND: HIGH=open, LOW=triggered
-  pinMode(PIN_ESTOP,     INPUT_PULLUP);    // NC button to GND: LOW=normal, HIGH=e-stop
   pinMode(PIN_LED,       OUTPUT);
 
   digitalWrite(PIN_STEP, LOW);
