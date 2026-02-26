@@ -1,0 +1,9 @@
+{
+  "arduino.path": "C:/Users/clara/AppData/Local/Programs/Arduino IDE",
+  "arduino.useArduinoCli": true,
+  "arduino.logLevel": "info",
+  "arduino.enableUSBDetection": true,
+  "files.associations": {
+    "*.ino": "cpp"
+  }
+}

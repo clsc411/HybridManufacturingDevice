@@ -1,0 +1,6 @@
+{
+    "board": "arduino:avr:nano:cpu=atmega328",
+    "sketch": "FinalResinSystem_copy_20260226085653.ino",
+    "port": "COM3",
+    "output": "build"
+}
