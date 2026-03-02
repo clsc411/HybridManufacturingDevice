@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import filedialog, font as tkfont
 
 import serial as pyserial
-from CalculateMoldVolume import compute_cavity_volume_ml, send_volume_to_arduino
+from CalculateMoldVolume import compute_cavity_volume_ml
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 DEFAULT_PORT      = "COM3"
@@ -102,6 +102,34 @@ class DispenseApp:
         tk.Entry(root, textvariable=self.overfill_var, width=8).grid(
             row=row, column=1, sticky="w", **pad)
 
+        # ── Staged Dispensing ─────────────────────────────────────────
+        row += 1
+        tk.Label(root, text="Staged Dispensing", font=section_font).grid(
+            row=row, column=0, sticky="w", **pad)
+
+        row += 1
+        self.staged_var = tk.BooleanVar(value=False)
+        self.staged_check = tk.Checkbutton(
+            root, text="Pour in intervals", variable=self.staged_var,
+            command=self._toggle_staged)
+        self.staged_check.grid(row=row, column=0, sticky="w", **pad)
+
+        row += 1
+        tk.Label(root, text="mL per pour:").grid(row=row, column=0, sticky="w", **pad)
+        self.seg_ml_var = tk.StringVar(value="25.0")
+        self.seg_ml_entry = tk.Entry(root, textvariable=self.seg_ml_var, width=8,
+                                     state="disabled")
+        self.seg_ml_entry.grid(row=row, column=1, sticky="w", **pad)
+
+        row += 1
+        tk.Label(root, text="Wait between (s):").grid(row=row, column=0, sticky="w", **pad)
+        self.wait_s_var = tk.StringVar(value="30")
+        self.wait_s_entry = tk.Entry(root, textvariable=self.wait_s_var, width=8,
+                                     state="disabled")
+        self.wait_s_entry.grid(row=row, column=1, sticky="w", **pad)
+        self.wait_hint = tk.Label(root, text="5 s \u2013 600 s (10 min)", fg="gray")
+        self.wait_hint.grid(row=row, column=2, sticky="w", **pad)
+
         # ── Buttons ───────────────────────────────────────────────────
         row += 1
         btn_frame = tk.Frame(root)
@@ -153,6 +181,24 @@ class DispenseApp:
             return val if val > 0 else DEFAULT_PURGE_ML
         except ValueError:
             return DEFAULT_PURGE_ML
+
+    def _toggle_staged(self):
+        state = "normal" if self.staged_var.get() else "disabled"
+        self.seg_ml_entry.config(state=state)
+        self.wait_s_entry.config(state=state)
+
+    def _get_staged_params(self):
+        """Return (segment_ml, wait_s) or None if staged dispensing is off.
+        Raises ValueError on bad input."""
+        if not self.staged_var.get():
+            return None
+        seg = float(self.seg_ml_var.get())
+        wait = int(float(self.wait_s_var.get()))
+        if seg <= 0:
+            raise ValueError("mL per pour must be greater than 0.")
+        if wait < 5 or wait > 600:
+            raise ValueError("Wait interval must be between 5 and 600 seconds.")
+        return seg, wait
 
     def _disable_buttons(self):
         self.send_btn.config(state="disabled")
@@ -241,6 +287,12 @@ class DispenseApp:
             self._set_status("No target volume set. Load an STL or enter manually.", color="red")
             return
 
+        try:
+            staged = self._get_staged_params()
+        except ValueError as e:
+            self._set_status(str(e), color="red")
+            return
+
         port = self.port_var.get().strip()
         target = self.target_ml
 
@@ -249,19 +301,53 @@ class DispenseApp:
 
         def send():
             try:
-                send_volume_to_arduino(port, DEFAULT_BAUD, target)
-                self.root.after(0, lambda: self._on_send_success(target))
+                with pyserial.Serial(port, DEFAULT_BAUD, timeout=120) as ser:
+                    time.sleep(2)
+                    ser.reset_input_buffer()
+
+                    # Build command list: configure staged params then set volume
+                    if staged:
+                        seg_ml, wait_s = staged
+                        cmds = [
+                            f"SEG {seg_ml:.2f}\n",
+                            f"WAIT {wait_s}\n",
+                            f"V {target:.2f}\n",
+                        ]
+                    else:
+                        cmds = [
+                            "SEG 0\n",
+                            "WAIT 0\n",
+                            f"V {target:.2f}\n",
+                        ]
+
+                    for cmd in cmds:
+                        ser.write(cmd.encode())
+                        while True:
+                            line = ser.readline().decode().strip()
+                            if line == "OK":
+                                break
+                            if line == "":
+                                raise RuntimeError("Arduino did not respond (timeout)")
+
+                self.root.after(0, lambda: self._on_send_success(target, staged))
             except Exception as e:
                 self.root.after(0, lambda: self._on_send_error(str(e)))
 
         threading.Thread(target=send, daemon=True).start()
 
-    def _on_send_success(self, target_ml):
+    def _on_send_success(self, target_ml, staged):
         self._enable_buttons()
-        self._set_status(
-            f"Arduino confirmed: TARGET_TOTAL_ML = {target_ml:.2f} mL. "
-            f"Start your print job.",
-            color="green")
+        if staged:
+            seg_ml, wait_s = staged
+            self._set_status(
+                f"Arduino set: {target_ml:.2f} mL in {seg_ml:.1f} mL pours, "
+                f"{wait_s} s apart. Start your print job.",
+                color="green")
+        else:
+            self._set_status(
+                f"Arduino confirmed: TARGET_TOTAL_ML = {target_ml:.2f} mL. "
+                f"Start your print job.",
+                color="green")
 
     def _on_send_error(self, msg):
         self._enable_buttons()
