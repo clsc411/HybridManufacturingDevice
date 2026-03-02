@@ -13,7 +13,14 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, font as tkfont
 
+import trimesh
 import serial as pyserial
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
 from CalculateMoldVolume import compute_cavity_volume_ml
 
 # ── Defaults ────────────────────────────────────────────────────────────────
@@ -34,26 +41,36 @@ class DispenseApp:
         self.outer_ml = None
         self.solid_ml = None
         self.target_ml = None
+        self._stl_mesh = None           # trimesh object for 3D preview
 
         pad = {"padx": 10, "pady": 4}
         section_font = tkfont.Font(weight="bold", size=10)
 
+        # ── Top-level two-column layout: controls | 3D preview ───────
+        left_frame = tk.Frame(root)
+        left_frame.grid(row=0, column=0, sticky="n")
+
+        right_frame = tk.LabelFrame(root, text="STL Preview", font=section_font)
+        right_frame.grid(row=0, column=1, sticky="n", padx=10, pady=10)
+
+        self._setup_preview(right_frame)
+
         # ── STL File Selection ──────────────────────────────────────────
         row = 0
-        tk.Label(root, text="Mold STL File", font=section_font).grid(
+        tk.Label(left_frame, text="Mold STL File", font=section_font).grid(
             row=row, column=0, sticky="w", **pad)
         row += 1
 
         self.stl_path_var = tk.StringVar(value="No file selected")
-        tk.Button(root, text="Browse STL File...", command=self._browse_stl).grid(
+        tk.Button(left_frame, text="Browse STL File...", command=self._browse_stl).grid(
             row=row, column=0, sticky="w", **pad)
-        tk.Label(root, textvariable=self.stl_path_var, fg="gray",
+        tk.Label(left_frame, textvariable=self.stl_path_var, fg="gray",
                  wraplength=350, justify="left").grid(
             row=row, column=1, columnspan=2, sticky="w", **pad)
 
         # ── Results ─────────────────────────────────────────────────────
         row += 1
-        tk.Label(root, text="Results", font=section_font).grid(
+        tk.Label(left_frame, text="Results", font=section_font).grid(
             row=row, column=0, sticky="w", **pad)
 
         self.result_labels = {}
@@ -65,74 +82,74 @@ class DispenseApp:
             "Target to dispense",
         ]:
             row += 1
-            tk.Label(root, text=f"{label_text}:").grid(
+            tk.Label(left_frame, text=f"{label_text}:").grid(
                 row=row, column=0, sticky="w", **pad)
             var = tk.StringVar(value="--")
-            tk.Label(root, textvariable=var, width=20, anchor="w").grid(
+            tk.Label(left_frame, textvariable=var, width=20, anchor="w").grid(
                 row=row, column=1, sticky="w", **pad)
             self.result_labels[label_text] = var
 
         # ── Manual Entry ────────────────────────────────────────────────
         row += 1
-        tk.Label(root, text="OR Manual Entry", font=section_font).grid(
+        tk.Label(left_frame, text="OR Manual Entry", font=section_font).grid(
             row=row, column=0, sticky="w", **pad)
         row += 1
-        tk.Label(root, text="Volume (mL):").grid(
+        tk.Label(left_frame, text="Volume (mL):").grid(
             row=row, column=0, sticky="w", **pad)
         self.manual_var = tk.StringVar()
-        tk.Entry(root, textvariable=self.manual_var, width=12).grid(
+        tk.Entry(left_frame, textvariable=self.manual_var, width=12).grid(
             row=row, column=1, sticky="w", **pad)
-        tk.Button(root, text="Use This Volume", command=self._use_manual).grid(
+        tk.Button(left_frame, text="Use This Volume", command=self._use_manual).grid(
             row=row, column=2, sticky="w", **pad)
 
         # ── Settings ───────────────────────────────────────────────────
         row += 1
-        tk.Label(root, text="Settings", font=section_font).grid(
+        tk.Label(left_frame, text="Settings", font=section_font).grid(
             row=row, column=0, sticky="w", **pad)
 
         row += 1
-        tk.Label(root, text="COM Port:").grid(row=row, column=0, sticky="w", **pad)
+        tk.Label(left_frame, text="COM Port:").grid(row=row, column=0, sticky="w", **pad)
         self.port_var = tk.StringVar(value=DEFAULT_PORT)
-        tk.Entry(root, textvariable=self.port_var, width=8).grid(
+        tk.Entry(left_frame, textvariable=self.port_var, width=8).grid(
             row=row, column=1, sticky="w", **pad)
 
         row += 1
-        tk.Label(root, text="Overfill %:").grid(row=row, column=0, sticky="w", **pad)
+        tk.Label(left_frame, text="Overfill %:").grid(row=row, column=0, sticky="w", **pad)
         self.overfill_var = tk.StringVar(value=str(DEFAULT_OVERFILL))
-        tk.Entry(root, textvariable=self.overfill_var, width=8).grid(
+        tk.Entry(left_frame, textvariable=self.overfill_var, width=8).grid(
             row=row, column=1, sticky="w", **pad)
 
         # ── Staged Dispensing ─────────────────────────────────────────
         row += 1
-        tk.Label(root, text="Staged Dispensing", font=section_font).grid(
+        tk.Label(left_frame, text="Staged Dispensing", font=section_font).grid(
             row=row, column=0, sticky="w", **pad)
 
         row += 1
         self.staged_var = tk.BooleanVar(value=False)
         self.staged_check = tk.Checkbutton(
-            root, text="Pour in intervals", variable=self.staged_var,
+            left_frame, text="Pour in intervals", variable=self.staged_var,
             command=self._toggle_staged)
         self.staged_check.grid(row=row, column=0, sticky="w", **pad)
 
         row += 1
-        tk.Label(root, text="mL per pour:").grid(row=row, column=0, sticky="w", **pad)
+        tk.Label(left_frame, text="mL per pour:").grid(row=row, column=0, sticky="w", **pad)
         self.seg_ml_var = tk.StringVar(value="25.0")
-        self.seg_ml_entry = tk.Entry(root, textvariable=self.seg_ml_var, width=8,
+        self.seg_ml_entry = tk.Entry(left_frame, textvariable=self.seg_ml_var, width=8,
                                      state="disabled")
         self.seg_ml_entry.grid(row=row, column=1, sticky="w", **pad)
 
         row += 1
-        tk.Label(root, text="Wait between (s):").grid(row=row, column=0, sticky="w", **pad)
+        tk.Label(left_frame, text="Wait between (s):").grid(row=row, column=0, sticky="w", **pad)
         self.wait_s_var = tk.StringVar(value="30")
-        self.wait_s_entry = tk.Entry(root, textvariable=self.wait_s_var, width=8,
+        self.wait_s_entry = tk.Entry(left_frame, textvariable=self.wait_s_var, width=8,
                                      state="disabled")
         self.wait_s_entry.grid(row=row, column=1, sticky="w", **pad)
-        self.wait_hint = tk.Label(root, text="5 s \u2013 600 s (10 min)", fg="gray")
+        self.wait_hint = tk.Label(left_frame, text="5 s \u2013 600 s (10 min)", fg="gray")
         self.wait_hint.grid(row=row, column=2, sticky="w", **pad)
 
         # ── Buttons ───────────────────────────────────────────────────
         row += 1
-        btn_frame = tk.Frame(root)
+        btn_frame = tk.Frame(left_frame)
         btn_frame.grid(row=row, column=0, columnspan=3, pady=12)
 
         self.send_btn = tk.Button(
@@ -147,21 +164,68 @@ class DispenseApp:
 
         # ── Purge Volume ──────────────────────────────────────────────
         row += 1
-        tk.Label(root, text="Purge volume (mL):").grid(row=row, column=0, sticky="w", **pad)
+        tk.Label(left_frame, text="Purge volume (mL):").grid(row=row, column=0, sticky="w", **pad)
         self.purge_ml_var = tk.StringVar(value=str(DEFAULT_PURGE_ML))
-        tk.Entry(root, textvariable=self.purge_ml_var, width=8).grid(
+        tk.Entry(left_frame, textvariable=self.purge_ml_var, width=8).grid(
             row=row, column=1, sticky="w", **pad)
-        tk.Label(root, text="Flush old resin before each cycle", fg="gray").grid(
+        tk.Label(left_frame, text="Flush old resin before each cycle", fg="gray").grid(
             row=row, column=2, sticky="w", **pad)
 
-        # ── Status Bar ─────────────────────────────────────────────────
-        row += 1
+        # ── Status Bar (spans full window width) ──────────────────────
         self.status_var = tk.StringVar(
             value="Ready. Purge tubing first, then load STL or enter volume.")
         self.status_label = tk.Label(
             root, textvariable=self.status_var, relief="sunken",
             anchor="w", padx=6, pady=4)
-        self.status_label.grid(row=row, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
+        self.status_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+
+    # ── 3D Preview ─────────────────────────────────────────────────────
+
+    def _setup_preview(self, parent):
+        """Create a matplotlib canvas for the isometric STL preview."""
+        self._fig = Figure(figsize=(3.2, 3.2), dpi=90, facecolor="#f0f0f0")
+        self._ax = self._fig.add_subplot(111, projection="3d")
+        self._ax.set_axis_off()
+        self._ax.set_title("No STL loaded", fontsize=9, color="gray")
+        self._fig.subplots_adjust(left=0, right=1, bottom=0, top=0.92)
+
+        self._canvas = FigureCanvasTkAgg(self._fig, master=parent)
+        self._canvas.get_tk_widget().pack()
+        self._canvas.draw()
+
+    def _show_stl_preview(self, mesh):
+        """Render the loaded trimesh mesh as an isometric 3D view."""
+        ax = self._ax
+        ax.clear()
+        ax.set_axis_off()
+
+        vertices = mesh.vertices
+        faces = mesh.faces
+
+        # Build polygon collection from mesh faces
+        poly = Poly3DCollection(
+            vertices[faces],
+            alpha=0.85,
+            facecolor="#5B9BD5",
+            edgecolor="#2a2a2a",
+            linewidth=0.15,
+        )
+        ax.add_collection3d(poly)
+
+        # Auto-scale axes to mesh bounds
+        mins = vertices.min(axis=0)
+        maxs = vertices.max(axis=0)
+        center = (mins + maxs) / 2
+        span = (maxs - mins).max() / 2 * 1.15  # slight padding
+        ax.set_xlim(center[0] - span, center[0] + span)
+        ax.set_ylim(center[1] - span, center[1] + span)
+        ax.set_zlim(center[2] - span, center[2] + span)
+
+        # Isometric viewing angle
+        ax.view_init(elev=30, azim=-45)
+        ax.set_title("Mold Preview", fontsize=9)
+
+        self._canvas.draw()
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -241,15 +305,20 @@ class DispenseApp:
 
         def compute():
             try:
+                mesh = trimesh.load_mesh(path)
                 cavity_ml, outer_ml, solid_ml = compute_cavity_volume_ml(path)
-                self.root.after(0, lambda: self._on_stl_success(cavity_ml, outer_ml, solid_ml))
+                self.root.after(0, lambda: self._on_stl_success(
+                    cavity_ml, outer_ml, solid_ml, mesh))
             except Exception as e:
                 self.root.after(0, lambda: self._on_stl_error(str(e)))
 
         threading.Thread(target=compute, daemon=True).start()
 
-    def _on_stl_success(self, cavity_ml, outer_ml, solid_ml):
+    def _on_stl_success(self, cavity_ml, outer_ml, solid_ml, mesh=None):
         self._update_results(cavity_ml, outer_ml, solid_ml)
+        if mesh is not None:
+            self._stl_mesh = mesh
+            self._show_stl_preview(mesh)
         self._set_status(
             f"STL loaded. Cavity = {cavity_ml:.2f} mL. "
             f"Target = {self.target_ml:.2f} mL. Ready to send.",
