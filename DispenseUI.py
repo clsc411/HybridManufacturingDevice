@@ -24,7 +24,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from CalculateMoldVolume import compute_cavity_volume_ml
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-DEFAULT_PORT      = "COM3"
+DEFAULT_PORT      = "COM5"
 DEFAULT_BAUD      = 115200
 DEFAULT_OVERFILL  = 5.0    # percent
 DEFAULT_PURGE_ML  = 10.0   # mL to push through tubing during purge
@@ -400,7 +400,7 @@ class DispenseApp:
 
                 self.root.after(0, lambda: self._on_send_success(target, staged))
             except Exception as e:
-                self.root.after(0, lambda: self._on_send_error(str(e)))
+                self.root.after(0, lambda e=e: self._on_send_error(str(e)))
 
         threading.Thread(target=send, daemon=True).start()
 
@@ -451,7 +451,7 @@ class DispenseApp:
 
                 self.root.after(0, lambda: self._on_purge_success(purge_ml))
             except Exception as e:
-                self.root.after(0, lambda: self._on_purge_error(str(e)))
+                self.root.after(0, lambda e=e: self._on_purge_error(str(e)))
 
         threading.Thread(target=do_purge, daemon=True).start()
 

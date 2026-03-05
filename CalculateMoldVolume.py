@@ -24,7 +24,7 @@ import trimesh
 import serial
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-PORT     = "COM3"    # must match Arduino port (check Device Manager)
+PORT     = "COM5"    # must match Arduino port (check Device Manager)
 BAUD     = 115200
 OVERFILL = 0.05      # 5% extra to ensure the cavity fills completely
 DEAD_ML  = 6.0       # mixer + tubing dead volume (measure once on your hardware)
