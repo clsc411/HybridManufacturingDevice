@@ -11,7 +11,7 @@ Purge button flushes old resin from tubing between cycles.
 import time
 import threading
 import tkinter as tk
-from tkinter import filedialog, font as tkfont
+from tkinter import filedialog, simpledialog, font as tkfont
 
 import trimesh
 import serial as pyserial
@@ -22,6 +22,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from CalculateMoldVolume import compute_cavity_volume_ml
+from ThermalCalculations import simulate as thermal_simulate, RESIN_DENSITY, MOLD_DENSITY
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 DEFAULT_PORT      = "COM5"
@@ -50,10 +51,16 @@ class DispenseApp:
         left_frame = tk.Frame(root)
         left_frame.grid(row=0, column=0, sticky="n")
 
-        right_frame = tk.LabelFrame(root, text="STL Preview", font=section_font)
+        right_frame = tk.Frame(root)
         right_frame.grid(row=0, column=1, sticky="n", padx=10, pady=10)
 
-        self._setup_preview(right_frame)
+        preview_frame = tk.LabelFrame(right_frame, text="STL Preview", font=section_font)
+        preview_frame.pack(side="top")
+        self._setup_preview(preview_frame)
+
+        thermal_frame = tk.LabelFrame(right_frame, text="Thermal Analysis", font=section_font)
+        thermal_frame.pack(side="top", pady=(8, 0))
+        self._setup_thermal_plot(thermal_frame)
 
         # ── STL File Selection ──────────────────────────────────────────
         row = 0
@@ -162,6 +169,11 @@ class DispenseApp:
             bg="#FF9800", fg="white", height=2, width=18)
         self.purge_btn.pack(side="left", padx=6)
 
+        self.override_btn = tk.Button(
+            btn_frame, text="Override Signal", command=self._override_signal,
+            bg="#D32F2F", fg="white", height=2, width=18)
+        self.override_btn.pack(side="left", padx=6)
+
         # ── Purge Volume ──────────────────────────────────────────────
         row += 1
         tk.Label(left_frame, text="Purge volume (mL):").grid(row=row, column=0, sticky="w", **pad)
@@ -226,6 +238,54 @@ class DispenseApp:
         ax.set_title("Mold Preview", fontsize=9)
 
         self._canvas.draw()
+
+    # ── Thermal Plot ─────────────────────────────────────────────────────
+
+    def _setup_thermal_plot(self, parent):
+        """Create a matplotlib canvas for the thermal simulation graph."""
+        self._therm_fig = Figure(figsize=(3.2, 2.4), dpi=90, facecolor="#f0f0f0")
+        self._therm_ax = self._therm_fig.add_subplot(111)
+        self._therm_ax.set_xlabel("Time (s)", fontsize=8)
+        self._therm_ax.set_ylabel("Temperature (C)", fontsize=8)
+        self._therm_ax.set_title("No data yet", fontsize=9, color="gray")
+        self._therm_fig.subplots_adjust(left=0.18, right=0.95, bottom=0.18, top=0.88)
+
+        self._therm_canvas = FigureCanvasTkAgg(self._therm_fig, master=parent)
+        self._therm_canvas.get_tk_widget().pack()
+
+        self._therm_info_var = tk.StringVar(value="")
+        tk.Label(parent, textvariable=self._therm_info_var, fg="#333",
+                 font=("TkDefaultFont", 8), justify="left").pack(anchor="w", padx=4)
+        self._therm_canvas.draw()
+
+    def _run_thermal(self, cavity_ml, solid_ml, mesh):
+        """Run thermal simulation using STL-derived values and update graph."""
+        # Derive parameters from the loaded STL and volume calculations
+        m_resin_g = cavity_ml * RESIN_DENSITY       # grams of resin
+        m_mold_g = solid_ml * MOLD_DENSITY           # grams of mold (solid volume in mL)
+        A_surface_cm2 = mesh.area / 100.0            # mesh.area is mm^2 -> cm^2
+
+        t, Tr, Tm, peak_r, peak_m = thermal_simulate(
+            m_resin_g=m_resin_g,
+            A_surface_cm2=A_surface_cm2,
+            m_mold_g=m_mold_g,
+        )
+
+        # Update the graph
+        ax = self._therm_ax
+        ax.clear()
+        ax.plot(t, Tr - 273.15, label="Resin", color="#D94F4F", linewidth=1.2)
+        ax.plot(t, Tm - 273.15, label="Mold", color="#5B9BD5", linewidth=1.2)
+        ax.set_xlabel("Time (s)", fontsize=8)
+        ax.set_ylabel("Temperature (C)", fontsize=8)
+        ax.set_title("Cure Temperature vs Time", fontsize=9)
+        ax.legend(fontsize=7, loc="upper right")
+        ax.tick_params(labelsize=7)
+        self._therm_canvas.draw()
+
+        self._therm_info_var.set(
+            f"Peak resin: {peak_r:.1f} C  |  Peak mold: {peak_m:.1f} C  |  "
+            f"Resin mass: {m_resin_g:.1f} g")
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -319,6 +379,7 @@ class DispenseApp:
         if mesh is not None:
             self._stl_mesh = mesh
             self._show_stl_preview(mesh)
+            self._run_thermal(cavity_ml, solid_ml, mesh)
         self._set_status(
             f"STL loaded. Cavity = {cavity_ml:.2f} mL. "
             f"Target = {self.target_ml:.2f} mL. Ready to send.",
@@ -422,7 +483,7 @@ class DispenseApp:
         self._enable_buttons()
         self._set_status(f"Send failed: {msg}", color="red")
 
-    # ── Purge ───────────────────────────────────────────────────────────
+    # Purge
 
     def _purge(self):
         port = self.port_var.get().strip()
@@ -465,6 +526,59 @@ class DispenseApp:
     def _on_purge_error(self, msg):
         self._enable_buttons()
         self._set_status(f"Purge failed: {msg}", color="red")
+
+    # Override Printer Signal (for testing)
+
+    def _override_signal(self):
+        """Manually trigger the dispense by sending OVERRIDE to the Arduino.
+        Requires the user to type 'duck' as a safety confirmation."""
+        answer = simpledialog.askstring(
+            "Confirm Override",
+            "This will manually trigger the dispense signal.\n\n"
+            "Type 'duck' to confirm:",
+            parent=self.root)
+
+        if answer is None:
+            return  # user cancelled
+        if answer.strip().lower() != "duck":
+            self._set_status("Override cancelled — incorrect confirmation word.", color="red")
+            return
+
+        if self.target_ml is None:
+            self._set_status("No target volume set. Load an STL or enter volume first.", color="red")
+            return
+
+        port = self.port_var.get().strip()
+        self._disable_buttons()
+        self._set_status("Sending override signal to Arduino...")
+
+        def do_override():
+            try:
+                with pyserial.Serial(port, DEFAULT_BAUD, timeout=120) as ser:
+                    time.sleep(2)
+                    ser.reset_input_buffer()
+                    ser.write(b"OVERRIDE\n")
+                    while True:
+                        line = ser.readline().decode().strip()
+                        if line == "OK":
+                            break
+                        if line == "":
+                            raise RuntimeError("Arduino did not respond (timeout)")
+                self.root.after(0, self._on_override_success)
+            except Exception as e:
+                self.root.after(0, lambda e=e: self._on_override_error(str(e)))
+
+        threading.Thread(target=do_override, daemon=True).start()
+
+    def _on_override_success(self):
+        self._enable_buttons()
+        self._set_status(
+            "Override sent — dispense triggered manually. Monitor the pour.",
+            color="green")
+
+    def _on_override_error(self, msg):
+        self._enable_buttons()
+        self._set_status(f"Override failed: {msg}", color="red")
 
 
 def main():
