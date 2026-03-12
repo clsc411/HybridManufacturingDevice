@@ -18,13 +18,12 @@ Sends the computed or entered volume to the Arduino over serial.
 The printer trigger on D8 fires the actual dispense — run this before starting the print.
 """
 
-import sys
 import time
 import trimesh
 import serial
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-PORT     = "COM5"    # must match Arduino port (check Device Manager)
+PORT     = "COM5"    # default — override with --port flag (check Device Manager)
 BAUD     = 115200
 OVERFILL = 0.05      # 5% extra to ensure the cavity fills completely
 DEAD_ML  = 6.0       # mixer + tubing dead volume (measure once on your hardware)
@@ -181,12 +180,18 @@ def get_target_ml_manual():
 
 
 def main():
-    if len(sys.argv) >= 2:
-        target_ml = get_target_ml_from_stl(sys.argv[1])
+    import argparse
+    parser = argparse.ArgumentParser(description="Calculate mold cavity volume and send to Arduino.")
+    parser.add_argument("stl", nargs="?", help="Path to mold STL file (omit for manual entry)")
+    parser.add_argument("--port", default=PORT, help=f"Serial port (default: {PORT})")
+    args = parser.parse_args()
+
+    if args.stl:
+        target_ml = get_target_ml_from_stl(args.stl)
     else:
         target_ml = get_target_ml_manual()
 
-    send_volume_to_arduino(PORT, BAUD, target_ml)
+    send_volume_to_arduino(args.port, BAUD, target_ml)
 
     print()
     print("Volume set. Start your print job.")
