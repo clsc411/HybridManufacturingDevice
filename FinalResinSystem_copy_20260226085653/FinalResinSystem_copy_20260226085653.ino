@@ -68,7 +68,7 @@ unsigned long WAIT_BETWEEN_S = 60; // wait between chunks (seconds)
 // Speed control:
 // We step at a constant rate derived from RPM.
 // 30 rpm @ 3200 steps/rev => 1600 steps/s => 625 us period per step (approx).
-float MOTOR_RPM = 30.0f;
+float MOTOR_RPM = 8.0f;
 
 // Common-anode wiring: LOW = current flows through optocoupler.
 // DM806I: ENA active (current) = motor DISABLED. So enable = no current = HIGH.
@@ -315,6 +315,9 @@ void handleSerial() {
   } else if (startsWith("PURGE ")) {
     purge(line.substring(6).toFloat());
   } else if (line == "GO") {
+    dispenseTotalMl(TARGET_TOTAL_ML);
+  } else if (line == "OVERRIDE") {
+    Serial.println(F("OVERRIDE: manual dispense trigger."));
     dispenseTotalMl(TARGET_TOTAL_ML);
   } else if (line == "HOME") {
     homeRetract();
