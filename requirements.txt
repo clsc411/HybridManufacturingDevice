@@ -1,0 +1,4 @@
+trimesh
+pyserial
+matplotlib
+numpy

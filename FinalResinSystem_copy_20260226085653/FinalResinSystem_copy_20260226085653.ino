@@ -37,18 +37,18 @@
 #include <Arduino.h>
 
 // ---------------- PINOUT ----------------
-const uint8_t PIN_STEP      = 2;   // PUL+
-const uint8_t PIN_DIR       = 4;   // DIR+
-const uint8_t PIN_EN        = 7;   // ENA+
-const uint8_t PIN_TRIGGER   = 8;   // start signal from printer (HIGH = start)
-const uint8_t PIN_LIMIT_EXT = 3;   // D3 - fully extended end stop (NO to GND)
-const uint8_t PIN_LIMIT_RET = 5;   // D5 - fully retracted / home end stop (NO to GND)
+const uint8_t PIN_STEP      = 6;   // PUL+  (D6)
+const uint8_t PIN_DIR       = 4;   // DIR+  (D4)
+const uint8_t PIN_EN        = 7;   // ENA+  (D7)
+const uint8_t PIN_TRIGGER   = 8;   // start signal from printer (not wired yet)
+const uint8_t PIN_LIMIT_EXT = 10;  // D10 - fully extended end stop (not wired yet)
+const uint8_t PIN_LIMIT_RET = 11;  // D11 - fully retracted / home (not wired yet)
 const uint8_t PIN_LED       = 13;  // built-in LED - state indicator
 
 // ---------------- MOTION / MECH PARAMS ----------------
 const long MOTOR_FULL_STEPS_PER_REV = 200;
 const long MICROSTEPS = 10;
-const float LEADSCREW_LEAD_MM = 2.0f;  // T8x2 lead = 2.0 mm per revolution
+const float LEADSCREW_LEAD_MM = 2.0f;
 
 // Syringes: internal diameter (mm)
 const float SYRINGE_ID_MM = 50.8f;
@@ -68,10 +68,10 @@ unsigned long WAIT_BETWEEN_S = 60; // wait between chunks (seconds)
 // Speed control:
 // We step at a constant rate derived from RPM.
 // 30 rpm @ 3200 steps/rev => 1600 steps/s => 625 us period per step (approx).
-float MOTOR_RPM = 30.0f;
+float MOTOR_RPM = 8.0f;
 
-// Enable polarity (depends on driver). Many drivers enable when EN is HIGH.
-// If opposite, flip this.
+// Common-anode wiring: LOW = current flows through optocoupler.
+// DM806I: ENA active (current) = motor DISABLED. So enable = no current = HIGH.
 const bool ENABLE_ACTIVE_HIGH = true;
 
 // Pick which way is "dispense" vs "retract"
@@ -140,8 +140,8 @@ long stepsForTravelMm(float travelMm) {
 }
 
 // ---------------- MOTION ----------------
-// Timing: step pulse width for DM806i (safe > 5 us)
-const unsigned int STEP_PULSE_US = 8;
+// Timing: step pulse width for DM806i (some units need 20+ us)
+const unsigned int STEP_PULSE_US = 50;
 
 // Compute step interval in microseconds from RPM
 unsigned long stepIntervalUsFromRPM(float rpm) {
@@ -155,9 +155,9 @@ void setEnable(bool enabled) {
 }
 
 void stepOnce(unsigned long stepIntervalUs) {
-  digitalWrite(PIN_STEP, HIGH);
+  digitalWrite(PIN_STEP, LOW);   // common-anode: LOW = active pulse
   delayMicroseconds(STEP_PULSE_US);
-  digitalWrite(PIN_STEP, LOW);
+  digitalWrite(PIN_STEP, HIGH);  // common-anode: HIGH = idle
   if (stepIntervalUs > STEP_PULSE_US) {
     delayMicroseconds(stepIntervalUs - STEP_PULSE_US);
   }
@@ -168,7 +168,8 @@ void stepOnce(unsigned long stepIntervalUs) {
 // An unexpected limit hit sets ABORTED state (requires RESET to resume).
 // Returns true if all steps completed, false if interrupted.
 bool moveSteps(long steps, bool dispenseDir) {
-  digitalWrite(PIN_DIR, dispenseDir ? DIR_DISPENSE_LEVEL : !DIR_DISPENSE_LEVEL);
+  // Common-anode: LOW = active. Invert DIR_DISPENSE_LEVEL for common-anode.
+  digitalWrite(PIN_DIR, dispenseDir ? !DIR_DISPENSE_LEVEL : DIR_DISPENSE_LEVEL);
   unsigned long dt = stepIntervalUsFromRPM(MOTOR_RPM);
 
   for (long i = 0; i < steps; i++) {
@@ -199,8 +200,8 @@ void homeRetract() {
   }
   Serial.println(F("HOME: retracting to limit switch..."));
   setEnable(true);
-  // Retract direction is opposite of dispense
-  digitalWrite(PIN_DIR, DIR_DISPENSE_LEVEL ? LOW : HIGH);
+  // Retract direction is opposite of dispense (inverted for common-anode)
+  digitalWrite(PIN_DIR, DIR_DISPENSE_LEVEL ? HIGH : LOW);
   unsigned long dt = stepIntervalUsFromRPM(MOTOR_RPM);
 
   while (digitalRead(PIN_LIMIT_RET) == HIGH) {
@@ -315,6 +316,9 @@ void handleSerial() {
     purge(line.substring(6).toFloat());
   } else if (line == "GO") {
     dispenseTotalMl(TARGET_TOTAL_ML);
+  } else if (line == "OVERRIDE") {
+    Serial.println(F("OVERRIDE: manual dispense trigger."));
+    dispenseTotalMl(TARGET_TOTAL_ML);
   } else if (line == "HOME") {
     homeRetract();
   } else if (line == "RESET") {
@@ -343,13 +347,13 @@ void handleSerial() {
   Serial.println(F("OK"));
 }
 
-// Trigger detect (rising edge on D8)
+// Trigger detect (falling edge on D8 — pulled HIGH by INPUT_PULLUP, ground to trigger)
 bool triggerStartDetected() {
-  static bool last = false;
+  static bool last = true;
   bool now = digitalRead(PIN_TRIGGER);
-  if (now && !last) {
+  if (!now && last) {
     delay(TRIGGER_DEBOUNCE_MS);
-    if (digitalRead(PIN_TRIGGER)) {
+    if (!digitalRead(PIN_TRIGGER)) {
       last = now;
       return true;
     }
@@ -362,13 +366,13 @@ void setup() {
   pinMode(PIN_STEP,      OUTPUT);
   pinMode(PIN_DIR,       OUTPUT);
   pinMode(PIN_EN,        OUTPUT);
-  pinMode(PIN_TRIGGER,   INPUT);           // external level shifter holds line LOW when idle
+  pinMode(PIN_TRIGGER,   INPUT_PULLUP);    // pulled HIGH when idle; ground D8 to trigger
   pinMode(PIN_LIMIT_EXT, INPUT_PULLUP);    // NO switch to GND: HIGH=open, LOW=triggered
   pinMode(PIN_LIMIT_RET, INPUT_PULLUP);    // NO switch to GND: HIGH=open, LOW=triggered
   pinMode(PIN_LED,       OUTPUT);
 
-  digitalWrite(PIN_STEP, LOW);
-  digitalWrite(PIN_DIR,  DIR_DISPENSE_LEVEL);
+  digitalWrite(PIN_STEP, HIGH);  // common-anode: HIGH = idle (no current)
+  digitalWrite(PIN_DIR,  HIGH);  // common-anode: HIGH = idle (no current)
   setEnable(false);
   digitalWrite(PIN_LED, LOW);
 

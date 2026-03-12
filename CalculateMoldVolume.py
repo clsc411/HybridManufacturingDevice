@@ -18,23 +18,24 @@ Sends the computed or entered volume to the Arduino over serial.
 The printer trigger on D8 fires the actual dispense — run this before starting the print.
 """
 
-import sys
 import time
 import trimesh
 import serial
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-PORT     = "COM3"    # must match Arduino port (check Device Manager)
+PORT     = "COM5"    # default — override with --port flag (check Device Manager)
 BAUD     = 115200
 OVERFILL = 0.05      # 5% extra to ensure the cavity fills completely
 DEAD_ML  = 6.0       # mixer + tubing dead volume (measure once on your hardware)
 # ────────────────────────────────────────────────────────────────────────────
 
-def compute_cavity_volume_ml(mold_stl_path):
-    mesh = trimesh.load_mesh(mold_stl_path)
+def _load_and_repair(stl_path, scale=1.0):
+    """Load an STL, apply scale, and attempt watertight repair. Returns mesh."""
+    mesh = trimesh.load_mesh(stl_path)
 
-    # Attempt automatic repair if the mesh isn't watertight.
-    # Common causes: open-top molds, minor CAD export issues.
+    if scale != 1.0:
+        mesh.apply_scale(scale)
+
     if not mesh.is_watertight:
         trimesh.repair.fill_holes(mesh)
         trimesh.repair.fix_winding(mesh)
@@ -42,10 +43,16 @@ def compute_cavity_volume_ml(mold_stl_path):
 
     if not mesh.is_watertight:
         raise ValueError(
-            f"Mold STL '{mold_stl_path}' could not be made watertight.\n"
+            f"STL '{stl_path}' could not be made watertight.\n"
             "Open it in your CAD tool, check for open edges or non-manifold geometry,\n"
             "repair and re-export as a closed solid."
         )
+
+    return mesh
+
+
+def compute_cavity_volume_ml(mold_stl_path, scale=1.0):
+    mesh = _load_and_repair(mold_stl_path, scale)
 
     # Convex hull volume = tight outer envelope around the mold's actual surface.
     # Works for both rectangular molds (exact) and conformal-wall molds (close
@@ -66,7 +73,7 @@ def compute_cavity_volume_ml(mold_stl_path):
         raise ValueError(
             f"Computed cavity volume is {cavity_mm3:.1f} mm³ (zero or negative).\n"
             "Likely causes:\n"
-            "  - STL is a solid part, not a mold\n"
+            "  - STL is a solid part, not a mold (use 'Part STL' mode instead)\n"
             "  - Mesh normals are inverted (try repairing in your CAD tool)"
         )
 
@@ -82,6 +89,41 @@ def compute_cavity_volume_ml(mold_stl_path):
                "         Verify the STL is a mold and not a solid part.")
 
     return cavity_ml, outer_vol_mm3 / 1000.0, mold_solid_mm3 / 1000.0
+
+
+def compute_cavity_from_part_ml(part_stl_path, wall_thickness_mm, scale=1.0):
+    """Compute mold cavity volume from a solid part STL and wall thickness.
+
+    The cavity volume equals the part volume (the mold is a negative of the part).
+    The outer mold volume is the bounding box of the part expanded by wall_thickness
+    on each side — this matches what slicers like Cura generate for their mold feature.
+
+    Returns (cavity_ml, outer_ml, solid_ml) — same tuple shape as
+    compute_cavity_volume_ml so callers can use either interchangeably.
+    """
+    mesh = _load_and_repair(part_stl_path, scale)
+
+    part_vol_mm3 = abs(mesh.volume)
+    if part_vol_mm3 <= 0:
+        raise ValueError("Part volume is zero — the STL may be empty or degenerate.")
+
+    cavity_ml = part_vol_mm3 / 1000.0
+
+    # Outer hull = convex hull of the part (the tight envelope around the part).
+    # This is what the user sees as the part's outer volume.
+    outer_vol_mm3 = mesh.convex_hull.volume
+    outer_ml = outer_vol_mm3 / 1000.0
+
+    # Mold solid volume = the printed plastic walls around the part.
+    # Estimated from the bounding box + wall offset minus the part volume.
+    bounds = mesh.bounds  # [[xmin,ymin,zmin], [xmax,ymax,zmax]]
+    dims = bounds[1] - bounds[0]
+    outer_dims = dims + 2 * wall_thickness_mm
+    mold_box_mm3 = outer_dims[0] * outer_dims[1] * outer_dims[2]
+    mold_solid_mm3 = mold_box_mm3 - part_vol_mm3
+    solid_ml = mold_solid_mm3 / 1000.0
+
+    return cavity_ml, outer_ml, solid_ml
 
 
 def send_volume_to_arduino(port, baud, target_ml):
@@ -138,12 +180,18 @@ def get_target_ml_manual():
 
 
 def main():
-    if len(sys.argv) >= 2:
-        target_ml = get_target_ml_from_stl(sys.argv[1])
+    import argparse
+    parser = argparse.ArgumentParser(description="Calculate mold cavity volume and send to Arduino.")
+    parser.add_argument("stl", nargs="?", help="Path to mold STL file (omit for manual entry)")
+    parser.add_argument("--port", default=PORT, help=f"Serial port (default: {PORT})")
+    args = parser.parse_args()
+
+    if args.stl:
+        target_ml = get_target_ml_from_stl(args.stl)
     else:
         target_ml = get_target_ml_manual()
 
-    send_volume_to_arduino(PORT, BAUD, target_ml)
+    send_volume_to_arduino(args.port, BAUD, target_ml)
 
     print()
     print("Volume set. Start your print job.")
