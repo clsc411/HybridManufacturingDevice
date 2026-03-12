@@ -446,11 +446,13 @@ class DispenseApp:
         self.send_btn.config(state="disabled")
         self.purge_btn.config(state="disabled")
         self.retract_btn.config(state="disabled")
+        self.override_btn.config(state="disabled")
         self.test_btn.config(state="disabled")
 
     def _enable_buttons(self):
         self.purge_btn.config(state="normal")
         self.retract_btn.config(state="normal")
+        self.override_btn.config(state="normal")
         self.test_btn.config(state="normal")
         if self.target_ml is not None:
             self.send_btn.config(state="normal")
@@ -727,9 +729,8 @@ class DispenseApp:
                     time.sleep(2)
                     ser.reset_input_buffer()
 
-                    ser.write(f"PURGE {purge_ml:.2f}\n".encode())
-
-                    # Read lines until "OK" — Arduino prints progress then OK
+                    # Clear any prior abort state so purge can execute
+                    ser.write(b"RESET\n")
                     while True:
                         line = ser.readline().decode().strip()
                         if line == "OK":
@@ -737,7 +738,23 @@ class DispenseApp:
                         if line == "":
                             raise RuntimeError("Arduino did not respond (timeout)")
 
-                self.root.after(0, lambda: self._on_purge_success(purge_ml))
+                    ser.write(f"PURGE {purge_ml:.2f}\n".encode())
+
+                    # Read lines until "OK" — Arduino prints progress then OK
+                    error_msg = None
+                    while True:
+                        line = ser.readline().decode().strip()
+                        if line == "OK":
+                            break
+                        if line == "":
+                            raise RuntimeError("Arduino did not respond (timeout)")
+                        if "LIMIT" in line or "Aborted" in line:
+                            error_msg = line
+
+                if error_msg:
+                    self.root.after(0, lambda m=error_msg: self._on_purge_error(m))
+                else:
+                    self.root.after(0, lambda: self._on_purge_success(purge_ml))
             except Exception as e:
                 self.root.after(0, lambda e=e: self._on_purge_error(str(e)))
 
@@ -776,8 +793,8 @@ class DispenseApp:
                     time.sleep(2)
                     ser.reset_input_buffer()
 
-                    ser.write(f"RETRACT {retract_ml:.2f}\n".encode())
-
+                    # Clear any prior abort state so retract can execute
+                    ser.write(b"RESET\n")
                     while True:
                         line = ser.readline().decode().strip()
                         if line == "OK":
@@ -785,7 +802,22 @@ class DispenseApp:
                         if line == "":
                             raise RuntimeError("Arduino did not respond (timeout)")
 
-                self.root.after(0, lambda: self._on_retract_success(retract_ml))
+                    ser.write(f"RETRACT {retract_ml:.2f}\n".encode())
+
+                    error_msg = None
+                    while True:
+                        line = ser.readline().decode().strip()
+                        if line == "OK":
+                            break
+                        if line == "":
+                            raise RuntimeError("Arduino did not respond (timeout)")
+                        if "LIMIT" in line or "Aborted" in line:
+                            error_msg = line
+
+                if error_msg:
+                    self.root.after(0, lambda m=error_msg: self._on_retract_error(m))
+                else:
+                    self.root.after(0, lambda: self._on_retract_success(retract_ml))
             except Exception as e:
                 self.root.after(0, lambda e=e: self._on_retract_error(str(e)))
 
@@ -837,6 +869,15 @@ class DispenseApp:
                     time.sleep(2)
                     ser.reset_input_buffer()
 
+                    # Clear any prior abort state
+                    ser.write(b"RESET\n")
+                    while True:
+                        line = ser.readline().decode().strip()
+                        if line == "OK":
+                            break
+                        if line == "":
+                            raise RuntimeError("Arduino did not respond (timeout)")
+
                     # Re-send settings (Arduino resets when serial opens)
                     if staged:
                         seg_ml, wait_s = staged
@@ -854,6 +895,7 @@ class DispenseApp:
                             "OVERRIDE\n",
                         ]
 
+                    error_msg = None
                     for cmd in cmds:
                         ser.write(cmd.encode())
                         while True:
@@ -862,7 +904,13 @@ class DispenseApp:
                                 break
                             if line == "":
                                 raise RuntimeError("Arduino did not respond (timeout)")
-                self.root.after(0, self._on_override_success)
+                            if "LIMIT" in line or "Aborted" in line:
+                                error_msg = line
+
+                if error_msg:
+                    self.root.after(0, lambda m=error_msg: self._on_override_error(m))
+                else:
+                    self.root.after(0, self._on_override_success)
             except Exception as e:
                 self.root.after(0, lambda e=e: self._on_override_error(str(e)))
 
