@@ -251,6 +251,11 @@ class DispenseApp:
             bg="#D32F2F", fg="white", height=2, width=18)
         self.override_btn.pack(side="left", padx=6)
 
+        self.retract_btn = tk.Button(
+            btn_frame, text="Retract Syringes", command=self._retract,
+            bg="#9C27B0", fg="white", height=2, width=18)
+        self.retract_btn.pack(side="left", padx=6)
+
         self.test_btn = tk.Button(
             btn_frame, text="Test Connection", command=self._test_connection,
             bg="#2196F3", fg="white", height=2, width=18)
@@ -263,6 +268,15 @@ class DispenseApp:
         tk.Entry(left_frame, textvariable=self.purge_ml_var, width=8).grid(
             row=row, column=1, sticky="w", **pad)
         tk.Label(left_frame, text="Flush old resin before each cycle", fg="gray").grid(
+            row=row, column=2, sticky="w", **pad)
+
+        # ── Retract Volume ────────────────────────────────────────────
+        row += 1
+        tk.Label(left_frame, text="Retract volume (mL):").grid(row=row, column=0, sticky="w", **pad)
+        self.retract_ml_var = tk.StringVar(value="5.0")
+        tk.Entry(left_frame, textvariable=self.retract_ml_var, width=8).grid(
+            row=row, column=1, sticky="w", **pad)
+        tk.Label(left_frame, text="Pull plungers back to relieve pressure", fg="gray").grid(
             row=row, column=2, sticky="w", **pad)
 
         # ── Status Bar (spans full window width) ──────────────────────
@@ -431,10 +445,12 @@ class DispenseApp:
     def _disable_buttons(self):
         self.send_btn.config(state="disabled")
         self.purge_btn.config(state="disabled")
+        self.retract_btn.config(state="disabled")
         self.test_btn.config(state="disabled")
 
     def _enable_buttons(self):
         self.purge_btn.config(state="normal")
+        self.retract_btn.config(state="normal")
         self.test_btn.config(state="normal")
         if self.target_ml is not None:
             self.send_btn.config(state="normal")
@@ -737,6 +753,53 @@ class DispenseApp:
     def _on_purge_error(self, msg):
         self._enable_buttons()
         self._set_status(f"Purge failed: {msg}", color="red")
+
+    # Retract Syringes
+
+    def _get_retract_ml(self):
+        try:
+            val = float(self.retract_ml_var.get())
+            return val if val > 0 else 5.0
+        except ValueError:
+            return 5.0
+
+    def _retract(self):
+        port = self.port_var.get().strip()
+        retract_ml = self._get_retract_ml()
+
+        self._disable_buttons()
+        self._set_status(f"Retracting {retract_ml:.1f} mL... (motor is running)")
+
+        def do_retract():
+            try:
+                with pyserial.Serial(port, DEFAULT_BAUD, timeout=120) as ser:
+                    time.sleep(2)
+                    ser.reset_input_buffer()
+
+                    ser.write(f"RETRACT {retract_ml:.2f}\n".encode())
+
+                    while True:
+                        line = ser.readline().decode().strip()
+                        if line == "OK":
+                            break
+                        if line == "":
+                            raise RuntimeError("Arduino did not respond (timeout)")
+
+                self.root.after(0, lambda: self._on_retract_success(retract_ml))
+            except Exception as e:
+                self.root.after(0, lambda e=e: self._on_retract_error(str(e)))
+
+        threading.Thread(target=do_retract, daemon=True).start()
+
+    def _on_retract_success(self, retract_ml):
+        self._enable_buttons()
+        self._set_status(
+            f"Retract complete ({retract_ml:.1f} mL). Syringes pulled back.",
+            color="green")
+
+    def _on_retract_error(self, msg):
+        self._enable_buttons()
+        self._set_status(f"Retract failed: {msg}", color="red")
 
     # Override Printer Signal (for testing)
 

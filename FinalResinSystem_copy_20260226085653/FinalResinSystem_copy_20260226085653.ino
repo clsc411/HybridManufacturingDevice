@@ -211,6 +211,21 @@ void homeRetract() {
   Serial.println(F("HOME: complete."));
 }
 
+// Retract syringes by a specified volume (mL).
+// Pulls plungers back to relieve pressure or withdraw resin from the nozzle.
+void retractMl(float ml) {
+  if (g_aborted) { Serial.println(F("Aborted. Send RESET first.")); return; }
+  Serial.print(F("RETRACT: ")); Serial.print(ml, 2); Serial.println(F(" mL"));
+  float travelMm = travelMmForTotalMl(ml);
+  long steps = stepsForTravelMm(travelMm);
+  Serial.print(F(" travel mm: ")); Serial.print(travelMm, 3);
+  Serial.print(F(" | steps: ")); Serial.println(steps);
+  setEnable(true);
+  moveSteps(steps, false);  // false = retract direction
+  setEnable(false);
+  if (!g_aborted) Serial.println(F("RETRACT: complete."));
+}
+
 // UC-06-FR2: Dispense mL to waste container then retract (purge/clean cycle).
 void purge(float ml) {
   if (g_aborted) { Serial.println(F("Aborted. Send RESET first.")); return; }
@@ -288,6 +303,7 @@ void dispenseTotalMl(float totalMl) {
 //   CAL 1.02    -> set calibration factor
 //   GO          -> start dispensing
 //   HOME        -> retract to home (retract limit switch)
+//   RETRACT 5   -> retract syringes by mL (pull plungers back)
 //   PURGE 20    -> dispense mL to waste then retract
 //   RESET       -> clear aborted state, return to IDLE
 //   STATUS      -> print current settings and state
@@ -312,6 +328,8 @@ void handleSerial() {
     MOTOR_RPM = line.substring(4).toFloat();
   } else if (startsWith("CAL ")) {
     CAL_FACTOR = line.substring(4).toFloat();
+  } else if (startsWith("RETRACT ")) {
+    retractMl(line.substring(8).toFloat());
   } else if (startsWith("PURGE ")) {
     purge(line.substring(6).toFloat());
   } else if (line == "GO") {
@@ -341,7 +359,7 @@ void handleSerial() {
     Serial.print(F("LIMIT_RET(D5)="));     Serial.println(digitalRead(PIN_LIMIT_RET) == LOW ? "TRIGGERED" : "open");
     Serial.println(F("----------------"));
   } else {
-    Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, GO, HOME, PURGE <ml>, RESET"));
+    Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, GO, HOME, PURGE <ml>, RETRACT <ml>, RESET"));
   }
 
   Serial.println(F("OK"));
@@ -378,7 +396,7 @@ void setup() {
 
   Serial.begin(115200);
   Serial.println(F("Resin Dispenser Ready."));
-  Serial.println(F("Commands: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, GO, HOME, PURGE <ml>, RESET"));
+  Serial.println(F("Commands: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, GO, HOME, PURGE <ml>, RETRACT <ml>, RESET"));
   setState(STATE_IDLE);
 }
 
