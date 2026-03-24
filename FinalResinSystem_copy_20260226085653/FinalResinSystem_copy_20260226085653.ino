@@ -75,7 +75,7 @@ float MOTOR_RPM = 8.0f;
 const bool ENABLE_ACTIVE_HIGH = true;
 
 // Pick which way is "dispense" vs "retract"
-const bool DIR_DISPENSE_LEVEL = HIGH;
+const bool DIR_DISPENSE_LEVEL = LOW;
 
 // Anti-drip retract at end (mm). Set 0 to disable.
 float RETRACT_MM = 0.5f;
@@ -86,9 +86,15 @@ const unsigned long TRIGGER_DEBOUNCE_MS = 50;
 const long STEPS_PER_REV = MOTOR_FULL_STEPS_PER_REV * MICROSTEPS;
 
 // ---------------- STATE (PR-05) ----------------
-enum DispenseState { STATE_IDLE, STATE_POURING, STATE_DONE, STATE_ABORTED };
+enum DispenseState { STATE_IDLE, STATE_POURING, STATE_DONE, STATE_ABORTED, STATE_PAUSED };
 DispenseState g_state = STATE_IDLE;
 bool g_aborted = false;
+volatile bool g_stopRequested = false;
+
+// Pause/resume tracking — saves position mid-dispense
+float g_pauseRemainingMl = 0.0f;
+long  g_pauseRemainingSteps = 0;
+bool  g_pauseInSegment = false;  // true if paused mid-segment (steps remain)
 
 void setState(DispenseState s) {
   g_state = s;
@@ -110,6 +116,10 @@ void setState(DispenseState s) {
       g_aborted = true;
       // LED rapid blink handled in loop()
       Serial.println(F("STATE: ABORTED - send RESET to resume"));
+      break;
+    case STATE_PAUSED:
+      // LED slow blink handled in loop()
+      Serial.println(F("STATE: PAUSED - send RESUME to continue or RESET to cancel"));
       break;
   }
 }
@@ -163,33 +173,54 @@ void stepOnce(unsigned long stepIntervalUs) {
   }
 }
 
+// Check serial buffer for a STOP command without blocking.
+// Reads available bytes looking for "STOP\n". Sets g_stopRequested if found.
+void checkForStopCommand() {
+  if (!Serial.available()) return;
+  // Peek at incoming data — read line if available
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line == "STOP") {
+    g_stopRequested = true;
+  }
+  // Other commands during motion are ignored (they'd conflict)
+}
+
 // Move steps in given direction.
 // Checks limit switches on every step — UC-05-FR2: hard stop within 1 step.
+// Checks for STOP command every 50 steps for pause support.
 // An unexpected limit hit sets ABORTED state (requires RESET to resume).
-// Returns true if all steps completed, false if interrupted.
-bool moveSteps(long steps, bool dispenseDir) {
+// Returns the number of steps remaining (0 = all completed).
+long moveSteps(long steps, bool dispenseDir) {
   // Common-anode: LOW = active. Invert DIR_DISPENSE_LEVEL for common-anode.
   digitalWrite(PIN_DIR, dispenseDir ? !DIR_DISPENSE_LEVEL : DIR_DISPENSE_LEVEL);
   unsigned long dt = stepIntervalUsFromRPM(MOTOR_RPM);
 
   for (long i = 0; i < steps; i++) {
+    // Check for STOP every 50 steps (fast enough to respond, minimal overhead)
+    if (i % 50 == 0) {
+      checkForStopCommand();
+      if (g_stopRequested) {
+        return steps - i;  // return remaining steps
+      }
+    }
     // Extended limit: only checked when dispensing — UC-05-FR2
     if (dispenseDir && digitalRead(PIN_LIMIT_EXT) == LOW) {
       setEnable(false);
       setState(STATE_ABORTED);
       Serial.println(F("LIMIT: extend end-stop triggered. Send RESET to resume."));
-      return false;
+      return -(steps - i);  // negative = aborted (not pauseable)
     }
     // Retract limit: only checked when retracting — UC-05-FR2
     if (!dispenseDir && digitalRead(PIN_LIMIT_RET) == LOW) {
       setEnable(false);
       setState(STATE_ABORTED);
       Serial.println(F("LIMIT: retract end-stop triggered. Send RESET to resume."));
-      return false;
+      return -(steps - i);  // negative = aborted
     }
     stepOnce(dt);
   }
-  return true;
+  return 0;  // all steps completed
 }
 
 // UC-05-FR3: Home by retracting until the retract limit switch activates.
@@ -240,17 +271,18 @@ void purge(float ml) {
   if (!g_aborted) Serial.println(F("PURGE: complete."));
 }
 
-// Dispense total mL (possibly in chunks)
+// Dispense total mL (possibly in chunks). Supports mid-dispense pause via STOP.
 void dispenseTotalMl(float totalMl) {
   if (g_aborted) { Serial.println(F("Aborted. Send RESET first.")); return; }
 
   Serial.print(F("Dispense request (total mixed mL): "));
   Serial.println(totalMl, 3);
   setState(STATE_POURING);
+  g_stopRequested = false;
 
   float remaining = totalMl;
 
-  while (remaining > 0.0001f && !g_aborted) {
+  while (remaining > 0.0001f && !g_aborted && !g_stopRequested) {
     float thisSeg = SEGMENT_ML;
     if (thisSeg <= 0) thisSeg = remaining;
     if (thisSeg > remaining) thisSeg = remaining;
@@ -263,26 +295,100 @@ void dispenseTotalMl(float totalMl) {
     Serial.print(F(" | steps: ")); Serial.println(steps);
 
     setEnable(true);
-    bool ok = moveSteps(steps, true);
+    long stepsLeft = moveSteps(steps, true);
     setEnable(false);
 
-    if (!ok || g_aborted) break;
+    if (stepsLeft < 0) break;   // aborted (limit switch)
+
+    if (stepsLeft > 0) {
+      // Paused mid-segment — save state for RESUME
+      g_pauseRemainingSteps = stepsLeft;
+      g_pauseRemainingMl = remaining - thisSeg;  // mL after this segment
+      g_pauseInSegment = true;
+      setState(STATE_PAUSED);
+      Serial.print(F("PAUSED: ")); Serial.print(stepsLeft);
+      Serial.println(F(" steps remain in segment."));
+      Serial.println(F("OK"));
+      return;
+    }
 
     remaining -= thisSeg;
 
     if (remaining > 0.0001f && WAIT_BETWEEN_S > 0) {
       Serial.print(F(" Waiting ")); Serial.print(WAIT_BETWEEN_S);
       Serial.println(F(" s before next segment..."));
-      delay(WAIT_BETWEEN_S * 1000UL);
+      // Check for STOP during wait interval (check every 100ms)
+      for (unsigned long w = 0; w < WAIT_BETWEEN_S * 10UL; w++) {
+        delay(100);
+        checkForStopCommand();
+        if (g_stopRequested) {
+          g_pauseRemainingSteps = 0;
+          g_pauseRemainingMl = remaining;
+          g_pauseInSegment = false;
+          setState(STATE_PAUSED);
+          Serial.print(F("PAUSED: ")); Serial.print(remaining, 3);
+          Serial.println(F(" mL remaining."));
+          Serial.println(F("OK"));
+          return;
+        }
+      }
     }
   }
 
-  if (!g_aborted) {
+  if (!g_aborted && !g_stopRequested) {
     // Anti-drip retract
     if (RETRACT_MM > 0.0f) {
       long rSteps = stepsForTravelMm(RETRACT_MM);
       Serial.print(F("Retract mm: ")); Serial.print(RETRACT_MM, 3);
       Serial.print(F(" | steps: ")); Serial.println(rSteps);
+      setEnable(true);
+      moveSteps(rSteps, false);
+      setEnable(false);
+    }
+    if (!g_aborted) {
+      setState(STATE_DONE);
+      Serial.println(F("DONE."));
+    }
+  }
+}
+
+// Resume a paused dispense from saved state.
+void resumeDispense() {
+  if (g_state != STATE_PAUSED) {
+    Serial.println(F("Not paused — nothing to resume."));
+    return;
+  }
+
+  Serial.println(F("Resuming dispense..."));
+  setState(STATE_POURING);
+  g_stopRequested = false;
+
+  // Finish remaining steps in the interrupted segment
+  if (g_pauseInSegment && g_pauseRemainingSteps > 0) {
+    Serial.print(F(" Completing segment: ")); Serial.print(g_pauseRemainingSteps);
+    Serial.println(F(" steps"));
+    setEnable(true);
+    long stepsLeft = moveSteps(g_pauseRemainingSteps, true);
+    setEnable(false);
+
+    if (stepsLeft < 0) return;  // aborted
+    if (stepsLeft > 0) {
+      // Paused again mid-segment
+      g_pauseRemainingSteps = stepsLeft;
+      setState(STATE_PAUSED);
+      Serial.println(F("PAUSED again."));
+      Serial.println(F("OK"));
+      return;
+    }
+  }
+
+  // Continue with remaining mL (full segments)
+  if (g_pauseRemainingMl > 0.0001f) {
+    dispenseTotalMl(g_pauseRemainingMl);
+  } else if (!g_aborted && g_state != STATE_PAUSED) {
+    // Anti-drip retract
+    if (RETRACT_MM > 0.0f) {
+      long rSteps = stepsForTravelMm(RETRACT_MM);
       setEnable(true);
       moveSteps(rSteps, false);
       setEnable(false);
@@ -339,13 +445,26 @@ void handleSerial() {
     dispenseTotalMl(TARGET_TOTAL_ML);
   } else if (line == "HOME") {
     homeRetract();
+  } else if (line == "STOP") {
+    // STOP during idle is a no-op (during motion it's handled in moveSteps)
+    if (g_state == STATE_POURING) {
+      g_stopRequested = true;  // will be picked up by moveSteps
+    } else {
+      Serial.println(F("Not pouring — nothing to stop."));
+    }
+  } else if (line == "RESUME") {
+    resumeDispense();
   } else if (line == "RESET") {
+    g_stopRequested = false;
+    g_pauseRemainingSteps = 0;
+    g_pauseRemainingMl = 0.0f;
+    g_pauseInSegment = false;
     setState(STATE_IDLE);
     Serial.println(F("System reset. Ready."));
   } else if (line == "PING") {
     // Respond to connection test from GUI — no action needed
   } else if (line == "STATUS") {
-    const char* stateNames[] = { "IDLE", "POURING", "DONE", "ABORTED" };
+    const char* stateNames[] = { "IDLE", "POURING", "DONE", "ABORTED", "PAUSED" };
     Serial.println(F("---- STATUS ----"));
     Serial.print(F("STATE="));             Serial.println(stateNames[g_state]);
     Serial.print(F("TARGET_TOTAL_ML="));   Serial.println(TARGET_TOTAL_ML, 3);
@@ -361,7 +480,7 @@ void handleSerial() {
     Serial.print(F("LIMIT_RET(D5)="));     Serial.println(digitalRead(PIN_LIMIT_RET) == LOW ? "TRIGGERED" : "open");
     Serial.println(F("----------------"));
   } else {
-    Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, GO, HOME, PURGE <ml>, RETRACT <ml>, RESET"));
+    Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, GO, HOME, PURGE <ml>, RETRACT <ml>, STOP, RESUME, RESET"));
   }
 
   Serial.println(F("OK"));
@@ -413,6 +532,18 @@ void loop() {
       ledOn = !ledOn;
       digitalWrite(PIN_LED, ledOn ? HIGH : LOW);
       lastBlink = millis();
+    }
+    return;
+  }
+
+  // When paused: blink LED slowly (1s on, 1s off)
+  if (g_state == STATE_PAUSED) {
+    static unsigned long lastPauseBlink = 0;
+    static bool pauseLedOn = false;
+    if (millis() - lastPauseBlink > 1000) {
+      pauseLedOn = !pauseLedOn;
+      digitalWrite(PIN_LED, pauseLedOn ? HIGH : LOW);
+      lastPauseBlink = millis();
     }
     return;
   }
