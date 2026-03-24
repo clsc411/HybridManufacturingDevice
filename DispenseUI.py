@@ -625,9 +625,29 @@ class DispenseApp:
 
         def send():
             try:
-                with pyserial.Serial(port, DEFAULT_BAUD, timeout=120) as ser:
+                # Retry port open up to 3 times (Windows port-release delay)
+                ser = None
+                for attempt in range(3):
+                    try:
+                        ser = pyserial.Serial(port, DEFAULT_BAUD, timeout=120)
+                        break
+                    except (OSError, pyserial.SerialException):
+                        if attempt == 2:
+                            raise
+                        time.sleep(1)
+
+                with ser:
                     time.sleep(2)
                     ser.reset_input_buffer()
+
+                    # Clear any prior abort state
+                    ser.write(b"RESET\n")
+                    while True:
+                        line = ser.readline().decode().strip()
+                        if line == "OK":
+                            break
+                        if line == "":
+                            raise RuntimeError("Arduino did not respond (timeout)")
 
                     # Build command list: configure staged params then set volume
                     if staged:
@@ -688,17 +708,36 @@ class DispenseApp:
 
         def do_test():
             try:
-                with pyserial.Serial(port, DEFAULT_BAUD, timeout=5) as ser:
+                # Retry port open up to 3 times (Windows port-release delay)
+                ser = None
+                for attempt in range(3):
+                    try:
+                        ser = pyserial.Serial(port, DEFAULT_BAUD, timeout=5)
+                        break
+                    except (OSError, pyserial.SerialException):
+                        if attempt == 2:
+                            raise
+                        time.sleep(1)
+
+                with ser:
                     time.sleep(2)
                     ser.reset_input_buffer()
                     ser.write(b"PING\n")
-                    line = ser.readline().decode().strip()
-                    if line == "OK":
+                    # Read lines until we get OK (skip any status messages)
+                    got_ok = False
+                    while True:
+                        line = ser.readline().decode().strip()
+                        if line == "OK":
+                            got_ok = True
+                            break
+                        if line == "":
+                            break  # timeout
+                    if got_ok:
                         self.root.after(0, lambda: self._on_test_result(
                             True, f"Connected to Arduino on {port}."))
                     else:
                         self.root.after(0, lambda: self._on_test_result(
-                            False, f"Unexpected response: '{line}'"))
+                            False, f"No response from Arduino on {port}."))
             except Exception as e:
                 self.root.after(0, lambda e=e: self._on_test_result(
                     False, str(e)))
@@ -723,9 +762,18 @@ class DispenseApp:
 
         def do_purge():
             try:
-                # Purge takes time (motor moves), so use a long timeout.
-                # Arduino prints status lines before final "OK".
-                with pyserial.Serial(port, DEFAULT_BAUD, timeout=120) as ser:
+                # Retry port open up to 3 times (Windows port-release delay)
+                ser = None
+                for attempt in range(3):
+                    try:
+                        ser = pyserial.Serial(port, DEFAULT_BAUD, timeout=120)
+                        break
+                    except (OSError, pyserial.SerialException):
+                        if attempt == 2:
+                            raise
+                        time.sleep(1)
+
+                with ser:
                     time.sleep(2)
                     ser.reset_input_buffer()
 
@@ -789,7 +837,18 @@ class DispenseApp:
 
         def do_retract():
             try:
-                with pyserial.Serial(port, DEFAULT_BAUD, timeout=120) as ser:
+                # Retry port open up to 3 times (Windows port-release delay)
+                ser = None
+                for attempt in range(3):
+                    try:
+                        ser = pyserial.Serial(port, DEFAULT_BAUD, timeout=120)
+                        break
+                    except (OSError, pyserial.SerialException):
+                        if attempt == 2:
+                            raise
+                        time.sleep(1)
+
+                with ser:
                     time.sleep(2)
                     ser.reset_input_buffer()
 
@@ -802,17 +861,31 @@ class DispenseApp:
                         if line == "":
                             raise RuntimeError("Arduino did not respond (timeout)")
 
-                    ser.write(f"RETRACT {retract_ml:.2f}\n".encode())
-
+                    log_lines = []
+                    cmds = [
+                        "STATUS\n",
+                        f"RETRACT {retract_ml:.2f}\n",
+                    ]
                     error_msg = None
-                    while True:
-                        line = ser.readline().decode().strip()
-                        if line == "OK":
-                            break
-                        if line == "":
-                            raise RuntimeError("Arduino did not respond (timeout)")
-                        if "LIMIT" in line or "Aborted" in line:
-                            error_msg = line
+                    for cmd in cmds:
+                        log_lines.append(f">> {cmd.strip()}")
+                        ser.write(cmd.encode())
+                        while True:
+                            line = ser.readline().decode().strip()
+                            if line:
+                                log_lines.append(f"<< {line}")
+                            if line == "OK":
+                                break
+                            if line == "":
+                                log_dump = "\n".join(log_lines)
+                                raise RuntimeError(
+                                    f"Arduino did not respond (timeout)\n"
+                                    f"Serial log:\n{log_dump}")
+                            if "LIMIT" in line or "Aborted" in line:
+                                error_msg = line
+
+                    log_dump = "\n".join(log_lines)
+                    print(f"[Retract serial log]\n{log_dump}")
 
                 if error_msg:
                     self.root.after(0, lambda m=error_msg: self._on_retract_error(m))
@@ -865,7 +938,19 @@ class DispenseApp:
                 staged = None
 
             try:
-                with pyserial.Serial(port, DEFAULT_BAUD, timeout=120) as ser:
+                # Retry port open up to 3 times (Windows sometimes holds
+                # the port briefly after a previous connection closes).
+                ser = None
+                for attempt in range(3):
+                    try:
+                        ser = pyserial.Serial(port, DEFAULT_BAUD, timeout=120)
+                        break
+                    except (OSError, pyserial.SerialException):
+                        if attempt == 2:
+                            raise
+                        time.sleep(1)
+
+                with ser:
                     time.sleep(2)
                     ser.reset_input_buffer()
 
@@ -885,6 +970,7 @@ class DispenseApp:
                             f"SEG {seg_ml:.2f}\n",
                             f"WAIT {wait_s}\n",
                             f"V {self.target_ml:.2f}\n",
+                            "STATUS\n",
                             "OVERRIDE\n",
                         ]
                     else:
@@ -892,20 +978,38 @@ class DispenseApp:
                             "SEG 0\n",
                             "WAIT 0\n",
                             f"V {self.target_ml:.2f}\n",
+                            "STATUS\n",
                             "OVERRIDE\n",
                         ]
 
                     error_msg = None
+                    log_lines = []
+                    in_status = False
                     for cmd in cmds:
+                        log_lines.append(f">> {cmd.strip()}")
+                        if cmd.strip() == "STATUS":
+                            in_status = True
                         ser.write(cmd.encode())
                         while True:
                             line = ser.readline().decode().strip()
+                            if line:
+                                log_lines.append(f"<< {line}")
                             if line == "OK":
+                                in_status = False
                                 break
                             if line == "":
-                                raise RuntimeError("Arduino did not respond (timeout)")
-                            if "LIMIT" in line or "Aborted" in line:
+                                # Dump the log so far for debugging
+                                log_dump = "\n".join(log_lines)
+                                raise RuntimeError(
+                                    f"Arduino did not respond (timeout)\n"
+                                    f"Serial log:\n{log_dump}")
+                            # Only flag LIMIT/Aborted from motor commands,
+                            # not from STATUS output (which reports switch state)
+                            if not in_status and ("LIMIT" in line or "Aborted" in line):
                                 error_msg = line
+
+                    log_dump = "\n".join(log_lines)
+                    print(f"[Override serial log]\n{log_dump}")
 
                 if error_msg:
                     self.root.after(0, lambda m=error_msg: self._on_override_error(m))

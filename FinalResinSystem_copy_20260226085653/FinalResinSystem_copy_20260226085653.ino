@@ -342,6 +342,8 @@ void handleSerial() {
   } else if (line == "RESET") {
     setState(STATE_IDLE);
     Serial.println(F("System reset. Ready."));
+  } else if (line == "PING") {
+    // Respond to connection test from GUI — no action needed
   } else if (line == "STATUS") {
     const char* stateNames[] = { "IDLE", "POURING", "DONE", "ABORTED" };
     Serial.println(F("---- STATUS ----"));
