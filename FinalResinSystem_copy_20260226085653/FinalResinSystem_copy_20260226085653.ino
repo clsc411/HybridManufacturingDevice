@@ -1,11 +1,11 @@
 /*
-  Automatic Resin Dispensing - Arduino Nano + DM806i (STEP/DIR/ENA)
+  Automatic Resin Dispensing - Arduino Nano + DM860I (STEP/DIR/ENA)
 
-  WIRING (matches schematic):
-    D2 -> PUL+ (STEP)
-    D4 -> DIR+ (DIR)
-    D7 -> ENA+ (ENABLE)
-    GND -> PUL-, DIR-, ENA-
+  WIRING (common-anode: all "+" tied to 5V, "-" to Arduino):
+    D4 -> PUL- (STEP)
+    D6 -> DIR- (DIR)
+    D7 -> ENA- (ENABLE)
+    5V -> PUL+, DIR+, ENA+ (daisy-chained)
 
   TRIGGER:
     D8 -> "DISPENSE_NOW" (HIGH = start). Current DAR diagram shows 12V->3.3V converter into D8.
@@ -29,7 +29,7 @@
     - Unexpected limit hit during dispense: driver disabled, system locked until RESET
 
   CHANGE THESE DEFAULTS to match hardware:
-    - MICROSTEPS must match DM806i DIP switch setting
+    - MICROSTEPS must match DM860I DIP switch setting
     - LEADSCREW_LEAD_MM (T8x2 => 2.0 mm lead)
     - SYRINGE_ID_MM (50.8 mm)
 */
@@ -37,12 +37,12 @@
 #include <Arduino.h>
 
 // ---------------- PINOUT ----------------
-const uint8_t PIN_STEP      = 6;   // PUL+  (D6)
-const uint8_t PIN_DIR       = 4;   // DIR+  (D4)
+const uint8_t PIN_STEP      = 4;   // PUL-  (D4)
+const uint8_t PIN_DIR       = 6;   // DIR-  (D6)
 const uint8_t PIN_EN        = 7;   // ENA+  (D7)
-const uint8_t PIN_TRIGGER   = 8;   // start signal from printer (not wired yet)
-const uint8_t PIN_LIMIT_EXT = 10;  // D10 - fully extended end stop (not wired yet)
-const uint8_t PIN_LIMIT_RET = 11;  // D11 - fully retracted / home (not wired yet)
+const uint8_t PIN_TRIGGER   = 8;   // start signal from printer (now wired)
+const uint8_t PIN_LIMIT_EXT = 3;  // D3 - fully extended end stop (now wired)
+const uint8_t PIN_LIMIT_RET = 5;  // D5 - fully retracted / home (now wired)
 const uint8_t PIN_LED       = 13;  // built-in LED - state indicator
 
 // ---------------- MOTION / MECH PARAMS ----------------
@@ -90,6 +90,7 @@ enum DispenseState { STATE_IDLE, STATE_POURING, STATE_DONE, STATE_ABORTED, STATE
 DispenseState g_state = STATE_IDLE;
 bool g_aborted = false;
 volatile bool g_stopRequested = false;
+bool g_triggerArmed = false;  // D8 trigger ignored until user sends volume via UI
 
 // Pause/resume tracking — saves position mid-dispense
 float g_pauseRemainingMl = 0.0f;
@@ -150,7 +151,7 @@ long stepsForTravelMm(float travelMm) {
 }
 
 // ---------------- MOTION ----------------
-// Timing: step pulse width for DM806i (some units need 20+ us)
+// Timing: step pulse width for DM860I (some units need 20+ us)
 const unsigned int STEP_PULSE_US = 50;
 
 // Compute step interval in microseconds from RPM
@@ -426,6 +427,7 @@ void handleSerial() {
 
   if (startsWith("V ")) {
     TARGET_TOTAL_ML = line.substring(2).toFloat();
+    g_triggerArmed = true;  // arm D8 trigger after user sets volume
   } else if (startsWith("SEG ")) {
     SEGMENT_ML = line.substring(4).toFloat();
   } else if (startsWith("WAIT ")) {
@@ -478,6 +480,7 @@ void handleSerial() {
     Serial.print(F("VOLUME_IS_TOTAL_MIXED=")); Serial.println(VOLUME_IS_TOTAL_MIXED ? "true" : "false");
     Serial.print(F("LIMIT_EXT(D3)="));     Serial.println(digitalRead(PIN_LIMIT_EXT) == LOW ? "TRIGGERED" : "open");
     Serial.print(F("LIMIT_RET(D5)="));     Serial.println(digitalRead(PIN_LIMIT_RET) == LOW ? "TRIGGERED" : "open");
+    Serial.print(F("TRIGGER(D8)="));       Serial.println(digitalRead(PIN_TRIGGER) == LOW ? "LOW" : "HIGH");
     Serial.println(F("----------------"));
   } else {
     Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, GO, HOME, PURGE <ml>, RETRACT <ml>, STOP, RESUME, RESET"));
@@ -487,12 +490,19 @@ void handleSerial() {
 }
 
 // Trigger detect (falling edge on D8 — pulled HIGH by INPUT_PULLUP, ground to trigger)
+// Ignores the first reading after boot to prevent false trigger if D8 is already LOW.
 bool triggerStartDetected() {
-  static bool last = true;
+  static bool last = digitalRead(PIN_TRIGGER);  // seed from actual pin state
+  static bool firstCall = true;
   bool now = digitalRead(PIN_TRIGGER);
-  if (!now && last) {
+  if (firstCall) {
+    firstCall = false;
+    last = now;
+    return false;  // never trigger on first call
+  }
+  if (now && !last) {
     delay(TRIGGER_DEBOUNCE_MS);
-    if (!digitalRead(PIN_TRIGGER)) {
+    if (digitalRead(PIN_TRIGGER)) {
       last = now;
       return true;
     }
@@ -505,7 +515,7 @@ void setup() {
   pinMode(PIN_STEP,      OUTPUT);
   pinMode(PIN_DIR,       OUTPUT);
   pinMode(PIN_EN,        OUTPUT);
-  pinMode(PIN_TRIGGER,   INPUT_PULLUP);    // pulled HIGH when idle; ground D8 to trigger
+  pinMode(PIN_TRIGGER,   INPUT);            // pulled LOW by external 1k resistor; KFAN2 signal pulls HIGH to trigger
   pinMode(PIN_LIMIT_EXT, INPUT_PULLUP);    // NO switch to GND: HIGH=open, LOW=triggered
   pinMode(PIN_LIMIT_RET, INPUT_PULLUP);    // NO switch to GND: HIGH=open, LOW=triggered
   pinMode(PIN_LED,       OUTPUT);
@@ -548,7 +558,7 @@ void loop() {
     return;
   }
 
-  if (triggerStartDetected()) {
+  if (g_state == STATE_IDLE && g_triggerArmed && triggerStartDetected()) {
     Serial.println(F("TRIGGER received on D8 -> starting dispense..."));
     dispenseTotalMl(TARGET_TOTAL_ML);
   }
