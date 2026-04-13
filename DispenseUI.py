@@ -27,7 +27,7 @@ from ThermalCalculations import simulate as thermal_simulate, RESIN_DENSITY, MOL
 # ── Defaults ────────────────────────────────────────────────────────────────
 DEFAULT_PORT      = "COM5"
 DEFAULT_BAUD      = 115200
-DEFAULT_OVERFILL  = 5.0    # percent
+DEFAULT_OVERFILL  = 0.0    # percent
 DEFAULT_PURGE_ML  = 10.0   # mL to push through tubing during purge
 NOZZLE_DEAD_ML    = 0.374  # mixing nozzle dead volume (374.17 mm³)
 
@@ -39,11 +39,13 @@ class DispenseApp:
     def __init__(self, root):
         self.root = root
         root.title("Hybrid Casting System \u2014 Dispense Setup")
-        root.resizable(False, False)
+        root.resizable(True, True)
 
         # Persistent serial connection (shared across all operations)
         self._ser = None
         self._ser_port = None  # track which port we opened
+        self._serial_lock = threading.Lock()  # prevent concurrent serial access
+        self._cancel_event = threading.Event()  # signal running ops to abort
 
         # Computed values (set after STL load)
         self.cavity_ml = None
@@ -57,11 +59,38 @@ class DispenseApp:
         section_font = tkfont.Font(weight="bold", size=10)
 
         # ── Top-level two-column layout: controls | 3D preview ───────
-        left_frame = tk.Frame(root)
-        left_frame.grid(row=0, column=0, sticky="n")
+        # Left column: scrollable canvas so the controls are accessible
+        # even on smaller screens.
+        root.grid_rowconfigure(0, weight=1)
+        root.grid_columnconfigure(0, weight=0)
+        root.grid_columnconfigure(1, weight=1)
+
+        left_canvas = tk.Canvas(root, highlightthickness=0)
+        left_scrollbar = tk.Scrollbar(root, orient="vertical",
+                                      command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
+
+        left_canvas.grid(row=0, column=0, sticky="ns")
+        left_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        left_frame = tk.Frame(left_canvas)
+        left_frame_id = left_canvas.create_window(
+            (0, 0), window=left_frame, anchor="nw")
+
+        def _on_left_configure(event):
+            # Match canvas width to content so nothing is clipped
+            left_canvas.configure(
+                scrollregion=left_canvas.bbox("all"),
+                width=event.width)
+        left_frame.bind("<Configure>", _on_left_configure)
+
+        # Mouse-wheel scrolling on the left panel
+        def _on_mousewheel(event):
+            left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        left_canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         right_frame = tk.Frame(root)
-        right_frame.grid(row=0, column=1, sticky="n", padx=10, pady=10)
+        right_frame.grid(row=0, column=2, sticky="n", padx=10, pady=10)
 
         preview_frame = tk.LabelFrame(right_frame, text="STL Preview", font=section_font)
         preview_frame.pack(side="top")
@@ -240,33 +269,37 @@ class DispenseApp:
         self.wait_hint = tk.Label(left_frame, text="5 s \u2013 600 s (10 min)", fg="gray")
         self.wait_hint.grid(row=row, column=2, sticky="w", **pad)
 
-        # ── Buttons ───────────────────────────────────────────────────
+        # ── Buttons (two rows so they fit on smaller screens) ────────
         row += 1
-        btn_frame = tk.Frame(left_frame)
-        btn_frame.grid(row=row, column=0, columnspan=3, pady=12)
+        btn_frame_top = tk.Frame(left_frame)
+        btn_frame_top.grid(row=row, column=0, columnspan=3, pady=(12, 2))
 
         self.send_btn = tk.Button(
-            btn_frame, text="Send to Arduino", command=self._send_to_arduino,
+            btn_frame_top, text="Send to Arduino", command=self._send_to_arduino,
             bg="#4CAF50", fg="white", height=2, width=18, state="disabled")
         self.send_btn.pack(side="left", padx=6)
 
         self.purge_btn = tk.Button(
-            btn_frame, text="Purge Tubing", command=self._purge,
+            btn_frame_top, text="Purge Tubing", command=self._purge,
             bg="#FF9800", fg="white", height=2, width=18)
         self.purge_btn.pack(side="left", padx=6)
 
         self.override_btn = tk.Button(
-            btn_frame, text="Override Signal", command=self._override_signal,
+            btn_frame_top, text="Override Signal", command=self._override_signal,
             bg="#D32F2F", fg="white", height=2, width=18)
         self.override_btn.pack(side="left", padx=6)
 
+        row += 1
+        btn_frame_bot = tk.Frame(left_frame)
+        btn_frame_bot.grid(row=row, column=0, columnspan=3, pady=(2, 12))
+
         self.retract_btn = tk.Button(
-            btn_frame, text="Retract Syringes", command=self._retract,
+            btn_frame_bot, text="Retract Syringes", command=self._retract,
             bg="#9C27B0", fg="white", height=2, width=18)
         self.retract_btn.pack(side="left", padx=6)
 
         self.test_btn = tk.Button(
-            btn_frame, text="Test Connection", command=self._test_connection,
+            btn_frame_bot, text="Test Connection", command=self._test_connection,
             bg="#2196F3", fg="white", height=2, width=18)
         self.test_btn.pack(side="left", padx=6)
 
@@ -288,13 +321,36 @@ class DispenseApp:
         tk.Label(left_frame, text="Pull plungers back to relieve pressure", fg="gray").grid(
             row=row, column=2, sticky="w", **pad)
 
+        # ── Anti-Backflow Settings ───────────────────────────────────
+        row += 1
+        tk.Label(left_frame, text="Anti-Backflow", font=section_font).grid(
+            row=row, column=0, sticky="w", **pad)
+
+        row += 1
+        tk.Label(left_frame, text="Post-dispense dwell (s):").grid(
+            row=row, column=0, sticky="w", **pad)
+        self.dwell_s_var = tk.StringVar(value="3")
+        tk.Entry(left_frame, textvariable=self.dwell_s_var, width=8).grid(
+            row=row, column=1, sticky="w", **pad)
+        tk.Label(left_frame, text="Hold motor after pour (pressure equalize)",
+                 fg="gray").grid(row=row, column=2, sticky="w", **pad)
+
+        row += 1
+        tk.Label(left_frame, text="Anti-drip retract (mm):").grid(
+            row=row, column=0, sticky="w", **pad)
+        self.retract_mm_var = tk.StringVar(value="0.5")
+        tk.Entry(left_frame, textvariable=self.retract_mm_var, width=8).grid(
+            row=row, column=1, sticky="w", **pad)
+        tk.Label(left_frame, text="Plunger pullback after dwell (0 = off)",
+                 fg="gray").grid(row=row, column=2, sticky="w", **pad)
+
         # ── Status Bar (spans full window width) ──────────────────────
         self.status_var = tk.StringVar(
             value="Ready. Purge tubing first, then load STL or enter volume.")
         self.status_label = tk.Label(
             root, textvariable=self.status_var, relief="sunken",
             anchor="w", padx=6, pady=4)
-        self.status_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+        self.status_label.grid(row=1, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
 
     # ── 3D Preview ─────────────────────────────────────────────────────
 
@@ -418,18 +474,25 @@ class DispenseApp:
         tk.Label(parent, textvariable=self._proc_status_var, fg="#555",
                  font=("TkDefaultFont", 8)).pack(anchor="w", padx=6, pady=(0, 4))
 
-    def _send_simple_command(self, cmd, on_success, on_error, status_msg):
+    def _send_simple_command(self, cmd, on_success, on_error, status_msg,
+                             timeout=10):
         """Send a single command to Arduino in a background thread."""
         port = self.port_var.get().strip()
         self._set_status(status_msg)
 
         def do_cmd():
+            if not self._serial_lock.acquire(timeout=5):
+                self.root.after(0, lambda: on_error(
+                    "Serial port busy — another operation is running."))
+                return
             try:
-                ser = self._ensure_serial(port=port, timeout=10)
+                ser = self._ensure_serial(port=port, timeout=timeout)
                 ser.write(f"{cmd}\n".encode())
                 # Read lines until OK
                 response_lines = []
                 while True:
+                    if self._cancel_event.is_set():
+                        raise RuntimeError("Cancelled by user")
                     line = ser.readline().decode().strip()
                     if line:
                         response_lines.append(line)
@@ -441,38 +504,51 @@ class DispenseApp:
             except Exception as e:
                 self._on_serial_error()
                 self.root.after(0, lambda e=e: on_error(str(e)))
+            finally:
+                self._serial_lock.release()
 
         threading.Thread(target=do_cmd, daemon=True).start()
 
+    # ── Process Control: Stop / Resume / Reset ─────────────────────────
+    #
+    # These commands must work even when another thread holds the serial
+    # lock (e.g. during an Override-triggered dispense).  Strategy:
+    #   STOP  — write-only; the running operation detects the pause.
+    #   RESET — write + signal cancel; close serial to force recovery.
+    #   RESUME — needs its own long timeout since it triggers a dispense.
+
     def _process_stop(self):
-        """Send STOP to pause the current dispense."""
-        self._send_simple_command(
-            "STOP",
-            on_success=self._on_stop_success,
-            on_error=self._on_stop_error,
-            status_msg="Sending STOP to Arduino...")
+        """Send STOP to pause the current dispense.
 
-    def _on_stop_success(self, lines):
-        paused = any("PAUSED" in l or "STATE: PAUSED" in l for l in lines)
-        if paused:
-            self._proc_status_var.set("Process PAUSED — Resume or Reset")
-            self._set_status("Process paused. Use Resume to continue or Reset to cancel.", color="#D84315")
-        else:
-            detail = lines[-2] if len(lines) >= 2 else "acknowledged"
-            self._proc_status_var.set(f"Stop sent: {detail}")
-            self._set_status(f"Stop sent: {detail}")
-
-    def _on_stop_error(self, msg):
-        self._proc_status_var.set("Stop failed")
-        self._set_status(f"Stop failed: {msg}", color="red")
+        Writes directly to the serial port so it works even while an
+        Override thread is reading.  The Arduino's checkForStopCommand()
+        picks it up during moveSteps().
+        """
+        ser = self._ser
+        if ser is None or not ser.is_open:
+            self._set_status("No serial connection — cannot send STOP.", color="red")
+            self._proc_status_var.set("Stop failed — no connection")
+            return
+        try:
+            ser.write(b"STOP\n")
+            self._proc_status_var.set("STOP sent — waiting for pause...")
+            self._set_status("STOP sent to Arduino.", color="#D84315")
+        except Exception as e:
+            self._proc_status_var.set("Stop failed")
+            self._set_status(f"Stop failed: {e}", color="red")
 
     def _process_resume(self):
-        """Send RESUME to continue a paused dispense."""
+        """Send RESUME to continue a paused dispense.
+
+        Uses a 120-second timeout because RESUME triggers the remaining
+        dispense, which can take minutes to complete.
+        """
         self._send_simple_command(
             "RESUME",
             on_success=self._on_resume_success,
             on_error=self._on_resume_error,
-            status_msg="Sending RESUME to Arduino...")
+            status_msg="Sending RESUME to Arduino...",
+            timeout=120)
 
     def _on_resume_success(self, lines):
         done = any("DONE" in l for l in lines)
@@ -492,20 +568,29 @@ class DispenseApp:
         self._set_status(f"Resume failed: {msg}", color="red")
 
     def _process_reset(self):
-        """Send RESET to cancel and return to IDLE."""
-        self._send_simple_command(
-            "RESET",
-            on_success=self._on_reset_success,
-            on_error=self._on_reset_error,
-            status_msg="Sending RESET to Arduino...")
+        """Send RESET and force-recover the serial connection.
 
-    def _on_reset_success(self, lines):
+        Writes RESET directly (works even if another thread holds the
+        lock), then signals the running operation to cancel and closes
+        the serial port so the next command gets a clean connection.
+        """
+        ser = self._ser
+        if ser is not None and ser.is_open:
+            try:
+                ser.write(b"RESET\n")
+            except Exception:
+                pass
+        # Signal any running operation to stop reading
+        self._cancel_event.set()
+        # Close the connection so running threads error out cleanly and
+        # the next operation reconnects with a fresh handshake + RESET.
+        self._close_serial()
+        self._cancel_event.clear()
         self._proc_status_var.set("No active process")
-        self._set_status("System reset. Ready for next operation.", color="green")
-
-    def _on_reset_error(self, msg):
-        self._proc_status_var.set("Reset failed")
-        self._set_status(f"Reset failed: {msg}", color="red")
+        self._set_status(
+            "Reset sent. Connection will refresh on next command.",
+            color="green")
+        self._enable_buttons()
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -525,6 +610,20 @@ class DispenseApp:
             return val if val > 0 else DEFAULT_PURGE_ML
         except ValueError:
             return DEFAULT_PURGE_ML
+
+    def _get_dwell_s(self):
+        try:
+            val = int(float(self.dwell_s_var.get()))
+            return max(val, 0)
+        except ValueError:
+            return 3
+
+    def _get_retract_mm(self):
+        try:
+            val = float(self.retract_mm_var.get())
+            return max(val, 0.0)
+        except ValueError:
+            return 0.5
 
     def _toggle_stl_mode(self):
         """Show/hide wall thickness field based on STL mode selection."""
@@ -806,11 +905,17 @@ class DispenseApp:
 
         port = self.port_var.get().strip()
         target = self.target_ml
+        dwell_s = self._get_dwell_s()
+        retract_mm = self._get_retract_mm()
 
         self._disable_buttons()
         self._set_status(f"Connecting to Arduino on {port}...")
 
         def send():
+            if not self._serial_lock.acquire(timeout=5):
+                self.root.after(0, lambda: self._on_send_error(
+                    "Serial port busy — another operation is running."))
+                return
             try:
                 ser = self._ensure_serial(port=port)
 
@@ -827,16 +932,20 @@ class DispenseApp:
                 if staged:
                     seg_ml, wait_s = staged
                     cmds = [
-                        "RPM 8\n",
+                        "RPM 4\n",
                         f"SEG {seg_ml:.2f}\n",
                         f"WAIT {wait_s}\n",
+                        f"DWELL {dwell_s}\n",
+                        f"RETMM {retract_mm:.2f}\n",
                         f"V {target:.2f}\n",
                     ]
                 else:
                     cmds = [
-                        "RPM 8\n",
+                        "RPM 4\n",
                         "SEG 0\n",
                         "WAIT 0\n",
+                        f"DWELL {dwell_s}\n",
+                        f"RETMM {retract_mm:.2f}\n",
                         f"V {target:.2f}\n",
                     ]
 
@@ -853,6 +962,8 @@ class DispenseApp:
             except Exception as e:
                 self._on_serial_error()
                 self.root.after(0, lambda e=e: self._on_send_error(str(e)))
+            finally:
+                self._serial_lock.release()
 
         threading.Thread(target=send, daemon=True).start()
 
@@ -882,6 +993,10 @@ class DispenseApp:
         self.test_btn.config(state="disabled")
 
         def do_test():
+            if not self._serial_lock.acquire(timeout=5):
+                self.root.after(0, lambda: self._on_test_result(
+                    False, "Serial port busy — another operation is running."))
+                return
             try:
                 ser = self._ensure_serial(port=port, timeout=5)
                 ser.write(b"PING\n")
@@ -904,6 +1019,8 @@ class DispenseApp:
                 self._on_serial_error()
                 self.root.after(0, lambda e=e: self._on_test_result(
                     False, str(e)))
+            finally:
+                self._serial_lock.release()
 
         threading.Thread(target=do_test, daemon=True).start()
 
@@ -924,6 +1041,10 @@ class DispenseApp:
         self._set_status(f"Purging {purge_ml:.1f} mL through tubing... (motor is running)")
 
         def do_purge():
+            if not self._serial_lock.acquire(timeout=5):
+                self.root.after(0, lambda: self._on_purge_error(
+                    "Serial port busy — another operation is running."))
+                return
             try:
                 ser = self._ensure_serial(port=port)
 
@@ -941,6 +1062,8 @@ class DispenseApp:
                 # Read lines until "OK" — Arduino prints progress then OK
                 error_msg = None
                 while True:
+                    if self._cancel_event.is_set():
+                        raise RuntimeError("Cancelled by user")
                     line = ser.readline().decode().strip()
                     if line == "OK":
                         break
@@ -956,6 +1079,8 @@ class DispenseApp:
             except Exception as e:
                 self._on_serial_error()
                 self.root.after(0, lambda e=e: self._on_purge_error(str(e)))
+            finally:
+                self._serial_lock.release()
 
         threading.Thread(target=do_purge, daemon=True).start()
 
@@ -987,6 +1112,10 @@ class DispenseApp:
         self._set_status(f"Retracting {retract_ml:.1f} mL... (motor is running)")
 
         def do_retract():
+            if not self._serial_lock.acquire(timeout=5):
+                self.root.after(0, lambda: self._on_retract_error(
+                    "Serial port busy — another operation is running."))
+                return
             try:
                 ser = self._ensure_serial(port=port)
 
@@ -1003,6 +1132,8 @@ class DispenseApp:
 
                 error_msg = None
                 while True:
+                    if self._cancel_event.is_set():
+                        raise RuntimeError("Cancelled by user")
                     line = ser.readline().decode().strip()
                     if line == "OK":
                         break
@@ -1018,6 +1149,8 @@ class DispenseApp:
             except Exception as e:
                 self._on_serial_error()
                 self.root.after(0, lambda e=e: self._on_retract_error(str(e)))
+            finally:
+                self._serial_lock.release()
 
         threading.Thread(target=do_retract, daemon=True).start()
 
@@ -1058,11 +1191,17 @@ class DispenseApp:
             staged = self._get_staged_params()
         except ValueError:
             pass
+        dwell_s = self._get_dwell_s()
+        retract_mm = self._get_retract_mm()
 
         self._disable_buttons()
         self._set_status("Sending override signal to Arduino...")
 
         def do_override():
+            if not self._serial_lock.acquire(timeout=5):
+                self.root.after(0, lambda: self._on_override_error(
+                    "Serial port busy — another operation is running."))
+                return
             try:
                 ser = self._ensure_serial(port=port)
 
@@ -1081,6 +1220,8 @@ class DispenseApp:
                     cmds = [
                         f"SEG {seg_ml:.2f}\n",
                         f"WAIT {wait_s}\n",
+                        f"DWELL {dwell_s}\n",
+                        f"RETMM {retract_mm:.2f}\n",
                         f"V {self.target_ml:.2f}\n",
                         "OVERRIDE\n",
                     ]
@@ -1088,16 +1229,21 @@ class DispenseApp:
                     cmds = [
                         "SEG 0\n",
                         "WAIT 0\n",
+                        f"DWELL {dwell_s}\n",
+                        f"RETMM {retract_mm:.2f}\n",
                         f"V {self.target_ml:.2f}\n",
                         "OVERRIDE\n",
                     ]
 
                 error_msg = None
+                paused = False
                 log_lines = []
                 for cmd in cmds:
                     log_lines.append(f">> {cmd.strip()}")
                     ser.write(cmd.encode())
                     while True:
+                        if self._cancel_event.is_set():
+                            raise RuntimeError("Cancelled by user")
                         line = ser.readline().decode().strip()
                         if line:
                             log_lines.append(f"<< {line}")
@@ -1110,25 +1256,38 @@ class DispenseApp:
                                 f"Serial log:\n{log_dump}")
                         if "LIMIT" in line or "Aborted" in line:
                             error_msg = line
+                        if "PAUSED" in line or "STATE: PAUSED" in line:
+                            paused = True
 
                 log_dump = "\n".join(log_lines)
                 print(f"[Override serial log]\n{log_dump}")
 
                 if error_msg:
                     self.root.after(0, lambda m=error_msg: self._on_override_error(m))
+                elif paused:
+                    self.root.after(0, self._on_override_paused)
                 else:
                     self.root.after(0, self._on_override_success)
             except Exception as e:
                 self._on_serial_error()
                 self.root.after(0, lambda e=e: self._on_override_error(str(e)))
+            finally:
+                self._serial_lock.release()
 
         threading.Thread(target=do_override, daemon=True).start()
 
     def _on_override_success(self):
         self._enable_buttons()
         self._set_status(
-            "Override sent — dispense triggered manually. Monitor the pour.",
+            "Override complete — dispense finished. Monitor the pour.",
             color="green")
+
+    def _on_override_paused(self):
+        self._enable_buttons()
+        self._proc_status_var.set("Process PAUSED — Resume or Reset")
+        self._set_status(
+            "Dispense paused by STOP. Use Resume to continue or Reset to cancel.",
+            color="#D84315")
 
     def _on_override_error(self, msg):
         self._enable_buttons()

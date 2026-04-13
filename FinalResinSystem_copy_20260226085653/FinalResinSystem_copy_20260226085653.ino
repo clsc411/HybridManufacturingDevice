@@ -68,7 +68,7 @@ unsigned long WAIT_BETWEEN_S = 60; // wait between chunks (seconds)
 // Speed control:
 // We step at a constant rate derived from RPM.
 // 30 rpm @ 3200 steps/rev => 1600 steps/s => 625 us period per step (approx).
-float MOTOR_RPM = 8.0f;
+float MOTOR_RPM = 4.0f;
 
 // Common-anode wiring: LOW = current flows through optocoupler.
 // DM806I: ENA active (current) = motor DISABLED. So enable = no current = HIGH.
@@ -79,6 +79,12 @@ const bool DIR_DISPENSE_LEVEL = LOW;
 
 // Anti-drip retract at end (mm). Set 0 to disable.
 float RETRACT_MM = 0.5f;
+
+// Post-dispense dwell: seconds to hold motor enabled (holding torque)
+// after the last segment finishes but BEFORE the anti-drip retract.
+// Lets pressure equalize so the retract doesn't create a vacuum that
+// sucks mixed resin back from the nozzle into the A/B lines.
+unsigned long DWELL_S = 0;
 
 // Debounce / trigger behavior
 const unsigned long TRIGGER_DEBOUNCE_MS = 50;
@@ -174,14 +180,24 @@ void stepOnce(unsigned long stepIntervalUs) {
   }
 }
 
-// Check serial buffer for a STOP command without blocking.
-// Reads available bytes looking for "STOP\n". Sets g_stopRequested if found.
+// Check serial buffer for STOP or RESET commands without blocking.
+// Reads available bytes looking for "STOP\n" or "RESET\n".
+// STOP  -> sets g_stopRequested (pause at next check point)
+// RESET -> sets g_aborted so moveSteps() aborts immediately, then
+//          loop() will process the queued RESET via handleSerial().
 void checkForStopCommand() {
   if (!Serial.available()) return;
   // Peek at incoming data — read line if available
   String line = Serial.readStringUntil('\n');
   line.trim();
   if (line == "STOP") {
+    g_stopRequested = true;
+  } else if (line == "RESET") {
+    // Force abort — moveSteps() will return negative, dispenseTotalMl()
+    // will exit.  The UI closes + reopens the serial connection after
+    // sending RESET, which triggers a fresh _ensure_serial() handshake
+    // that sends another RESET to clear the abort state cleanly.
+    g_aborted = true;
     g_stopRequested = true;
   }
   // Other commands during motion are ignored (they'd conflict)
@@ -198,11 +214,16 @@ long moveSteps(long steps, bool dispenseDir) {
   unsigned long dt = stepIntervalUsFromRPM(MOTOR_RPM);
 
   for (long i = 0; i < steps; i++) {
-    // Check for STOP every 50 steps (fast enough to respond, minimal overhead)
+    // Check for STOP/RESET every 50 steps (fast enough to respond, minimal overhead)
     if (i % 50 == 0) {
       checkForStopCommand();
+      if (g_aborted) {
+        // RESET received via serial during motion — abort immediately
+        setEnable(false);
+        return -(steps - i);  // negative = aborted
+      }
       if (g_stopRequested) {
-        return steps - i;  // return remaining steps
+        return steps - i;  // return remaining steps (positive = pause)
       }
     }
     // Extended limit: only checked when dispensing — UC-05-FR2
@@ -337,15 +358,31 @@ void dispenseTotalMl(float totalMl) {
   }
 
   if (!g_aborted && !g_stopRequested) {
+    // Post-dispense dwell: keep motor enabled (holding torque) while
+    // pressure in the tubing equalizes.  This prevents the retract
+    // from creating a vacuum that sucks mixed resin back from the
+    // nozzle into the A/B lines.
+    if (DWELL_S > 0) {
+      Serial.print(F("Dwell: holding ")); Serial.print(DWELL_S);
+      Serial.println(F(" s for pressure equalize..."));
+      setEnable(true);
+      for (unsigned long d = 0; d < DWELL_S * 10UL; d++) {
+        delay(100);
+        checkForStopCommand();
+        if (g_stopRequested || g_aborted) break;
+      }
+    }
+
     // Anti-drip retract
-    if (RETRACT_MM > 0.0f) {
+    if (!g_aborted && !g_stopRequested && RETRACT_MM > 0.0f) {
       long rSteps = stepsForTravelMm(RETRACT_MM);
       Serial.print(F("Retract mm: ")); Serial.print(RETRACT_MM, 3);
       Serial.print(F(" | steps: ")); Serial.println(rSteps);
       setEnable(true);
       moveSteps(rSteps, false);
-      setEnable(false);
     }
+    setEnable(false);
+
     if (!g_aborted) {
       setState(STATE_DONE);
       Serial.println(F("DONE."));
@@ -387,13 +424,24 @@ void resumeDispense() {
   if (g_pauseRemainingMl > 0.0001f) {
     dispenseTotalMl(g_pauseRemainingMl);
   } else if (!g_aborted && g_state != STATE_PAUSED) {
+    // Post-dispense dwell (same as dispenseTotalMl end sequence)
+    if (DWELL_S > 0) {
+      Serial.print(F("Dwell: holding ")); Serial.print(DWELL_S);
+      Serial.println(F(" s for pressure equalize..."));
+      setEnable(true);
+      for (unsigned long d = 0; d < DWELL_S * 10UL; d++) {
+        delay(100);
+        checkForStopCommand();
+        if (g_stopRequested || g_aborted) break;
+      }
+    }
     // Anti-drip retract
-    if (RETRACT_MM > 0.0f) {
+    if (!g_aborted && !g_stopRequested && RETRACT_MM > 0.0f) {
       long rSteps = stepsForTravelMm(RETRACT_MM);
       setEnable(true);
       moveSteps(rSteps, false);
-      setEnable(false);
     }
+    setEnable(false);
     if (!g_aborted) {
       setState(STATE_DONE);
       Serial.println(F("DONE."));
@@ -408,6 +456,8 @@ void resumeDispense() {
 //   WAIT 60     -> set wait seconds between segments
 //   RPM 30      -> set motor RPM
 //   CAL 1.02    -> set calibration factor
+//   DWELL 5     -> set post-dispense dwell seconds (pressure equalize)
+//   RETMM 1.0   -> set anti-drip retract distance (mm)
 //   GO          -> start dispensing
 //   HOME        -> retract to home (retract limit switch)
 //   RETRACT 5   -> retract syringes by mL (pull plungers back)
@@ -436,6 +486,10 @@ void handleSerial() {
     MOTOR_RPM = line.substring(4).toFloat();
   } else if (startsWith("CAL ")) {
     CAL_FACTOR = line.substring(4).toFloat();
+  } else if (startsWith("DWELL ")) {
+    DWELL_S = (unsigned long)line.substring(6).toInt();
+  } else if (startsWith("RETMM ")) {
+    RETRACT_MM = line.substring(6).toFloat();
   } else if (startsWith("RETRACT ")) {
     retractMl(line.substring(8).toFloat());
   } else if (startsWith("PURGE ")) {
@@ -474,6 +528,8 @@ void handleSerial() {
     Serial.print(F("WAIT_BETWEEN_S="));    Serial.println(WAIT_BETWEEN_S);
     Serial.print(F("MOTOR_RPM="));         Serial.println(MOTOR_RPM, 3);
     Serial.print(F("CAL_FACTOR="));        Serial.println(CAL_FACTOR, 4);
+    Serial.print(F("DWELL_S="));           Serial.println(DWELL_S);
+    Serial.print(F("RETRACT_MM="));        Serial.println(RETRACT_MM, 3);
     Serial.print(F("STEPS_PER_REV="));     Serial.println(STEPS_PER_REV);
     Serial.print(F("LEADSCREW_LEAD_MM=")); Serial.println(LEADSCREW_LEAD_MM, 3);
     Serial.print(F("SYRINGE_ID_MM="));     Serial.println(SYRINGE_ID_MM, 3);
@@ -483,7 +539,7 @@ void handleSerial() {
     Serial.print(F("TRIGGER(D8)="));       Serial.println(digitalRead(PIN_TRIGGER) == LOW ? "LOW" : "HIGH");
     Serial.println(F("----------------"));
   } else {
-    Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, GO, HOME, PURGE <ml>, RETRACT <ml>, STOP, RESUME, RESET"));
+    Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, DWELL <s>, RETMM <mm>, GO, HOME, PURGE <ml>, RETRACT <ml>, STOP, RESUME, RESET"));
   }
 
   Serial.println(F("OK"));
