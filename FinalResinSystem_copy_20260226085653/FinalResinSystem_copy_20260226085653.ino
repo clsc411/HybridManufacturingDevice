@@ -54,7 +54,7 @@ const float LEADSCREW_LEAD_MM = 2.0f;
 const float SYRINGE_ID_MM = 50.8f;
 
 // Calibration factor 1.02 was used in last sem testing.
-float CAL_FACTOR = 1.02f;
+float CAL_FACTOR = 0.55f;
 
 // If target volume is TOTAL mixed output (A+B), keep this true.
 // If instead we want "per syringe" volume, set false.
@@ -80,6 +80,21 @@ const bool DIR_DISPENSE_LEVEL = LOW;
 // Anti-drip retract at end (mm). Set 0 to disable.
 float RETRACT_MM = 0.5f;
 
+// Max retract as % of dispense travel — prevents the retract from
+// pulling back a huge fraction of the pour at small volumes.
+// At 8 mL with CAL 0.55 the dispense travel is only ~1.1 mm, so a
+// 0.5 mm retract would be 46% of the pour.  Capping at 10% keeps
+// the retract proportional.  Set 0 to disable the cap (always use
+// full RETRACT_MM).
+float MAX_RETRACT_PCT = 10.0f;
+
+// Fixed volume offset (mL) added to every dispense to compensate for
+// startup losses — leadscrew backlash, plunger compliance, line
+// pressurisation.  Negligible at large volumes but significant at
+// small ones.  Tune empirically: dispense a known small volume into a
+// graduated container and increase this until the output matches.
+float STARTUP_OFFSET_ML = 0.0f;
+
 // Post-dispense dwell: seconds to hold motor enabled (holding torque)
 // after the last segment finishes but BEFORE the anti-drip retract.
 // Lets pressure equalize so the retract doesn't create a vacuum that
@@ -99,6 +114,7 @@ volatile bool g_stopRequested = false;
 bool g_triggerArmed = false;  // D8 trigger ignored until user sends volume via UI
 
 // Pause/resume tracking — saves position mid-dispense
+float g_effectiveTotalMl = 0.0f;  // total effective mL for current dispense (for retract cap)
 float g_pauseRemainingMl = 0.0f;
 long  g_pauseRemainingSteps = 0;
 bool  g_pauseInSegment = false;  // true if paused mid-segment (steps remain)
@@ -154,6 +170,15 @@ float travelMmForTotalMl(float totalMl) {
 long stepsForTravelMm(float travelMm) {
   float revs = travelMm / LEADSCREW_LEAD_MM;
   return (long)(revs * (float)STEPS_PER_REV + 0.5f);
+}
+
+// Compute the effective retract distance (mm), capped so it never
+// exceeds MAX_RETRACT_PCT of the dispense travel.
+float cappedRetractMm(float pourTravelMm) {
+  if (RETRACT_MM <= 0.0f) return 0.0f;
+  if (MAX_RETRACT_PCT <= 0.0f) return RETRACT_MM;  // cap disabled
+  float maxRet = pourTravelMm * (MAX_RETRACT_PCT / 100.0f);
+  return (RETRACT_MM < maxRet) ? RETRACT_MM : maxRet;
 }
 
 // ---------------- MOTION ----------------
@@ -297,12 +322,24 @@ void purge(float ml) {
 void dispenseTotalMl(float totalMl) {
   if (g_aborted) { Serial.println(F("Aborted. Send RESET first.")); return; }
 
+  // Apply startup offset to compensate for backlash / compliance
+  float effective = totalMl + STARTUP_OFFSET_ML;
+
+  g_effectiveTotalMl = effective;  // save for retract cap (also used by resume)
+
   Serial.print(F("Dispense request (total mixed mL): "));
-  Serial.println(totalMl, 3);
+  Serial.print(totalMl, 3);
+  if (STARTUP_OFFSET_ML > 0.0001f) {
+    Serial.print(F(" + offset "));
+    Serial.print(STARTUP_OFFSET_ML, 3);
+    Serial.print(F(" = "));
+    Serial.print(effective, 3);
+  }
+  Serial.println();
   setState(STATE_POURING);
   g_stopRequested = false;
 
-  float remaining = totalMl;
+  float remaining = effective;
 
   while (remaining > 0.0001f && !g_aborted && !g_stopRequested) {
     float thisSeg = SEGMENT_ML;
@@ -373,10 +410,16 @@ void dispenseTotalMl(float totalMl) {
       }
     }
 
-    // Anti-drip retract
-    if (!g_aborted && !g_stopRequested && RETRACT_MM > 0.0f) {
-      long rSteps = stepsForTravelMm(RETRACT_MM);
-      Serial.print(F("Retract mm: ")); Serial.print(RETRACT_MM, 3);
+    // Anti-drip retract (capped so it can't dominate small pours)
+    float pourTravelMm = travelMmForTotalMl(effective);
+    float retMm = cappedRetractMm(pourTravelMm);
+    if (!g_aborted && !g_stopRequested && retMm > 0.0f) {
+      long rSteps = stepsForTravelMm(retMm);
+      Serial.print(F("Retract mm: ")); Serial.print(retMm, 3);
+      if (retMm < RETRACT_MM) {
+        Serial.print(F(" (capped from ")); Serial.print(RETRACT_MM, 3);
+        Serial.print(F(")"));
+      }
       Serial.print(F(" | steps: ")); Serial.println(rSteps);
       setEnable(true);
       moveSteps(rSteps, false);
@@ -435,9 +478,11 @@ void resumeDispense() {
         if (g_stopRequested || g_aborted) break;
       }
     }
-    // Anti-drip retract
-    if (!g_aborted && !g_stopRequested && RETRACT_MM > 0.0f) {
-      long rSteps = stepsForTravelMm(RETRACT_MM);
+    // Anti-drip retract (capped, same as dispenseTotalMl)
+    float pourTravelMm = travelMmForTotalMl(g_effectiveTotalMl);
+    float retMm = cappedRetractMm(pourTravelMm);
+    if (!g_aborted && !g_stopRequested && retMm > 0.0f) {
+      long rSteps = stepsForTravelMm(retMm);
       setEnable(true);
       moveSteps(rSteps, false);
     }
@@ -458,6 +503,8 @@ void resumeDispense() {
 //   CAL 1.02    -> set calibration factor
 //   DWELL 5     -> set post-dispense dwell seconds (pressure equalize)
 //   RETMM 1.0   -> set anti-drip retract distance (mm)
+//   RETPCT 10   -> set max retract as % of pour travel (0 = no cap)
+//   OFFSET 2.0  -> set startup volume offset (mL) for backlash compensation
 //   GO          -> start dispensing
 //   HOME        -> retract to home (retract limit switch)
 //   RETRACT 5   -> retract syringes by mL (pull plungers back)
@@ -490,6 +537,10 @@ void handleSerial() {
     DWELL_S = (unsigned long)line.substring(6).toInt();
   } else if (startsWith("RETMM ")) {
     RETRACT_MM = line.substring(6).toFloat();
+  } else if (startsWith("RETPCT ")) {
+    MAX_RETRACT_PCT = line.substring(7).toFloat();
+  } else if (startsWith("OFFSET ")) {
+    STARTUP_OFFSET_ML = line.substring(7).toFloat();
   } else if (startsWith("RETRACT ")) {
     retractMl(line.substring(8).toFloat());
   } else if (startsWith("PURGE ")) {
@@ -512,6 +563,7 @@ void handleSerial() {
     resumeDispense();
   } else if (line == "RESET") {
     g_stopRequested = false;
+    g_effectiveTotalMl = 0.0f;
     g_pauseRemainingSteps = 0;
     g_pauseRemainingMl = 0.0f;
     g_pauseInSegment = false;
@@ -530,6 +582,8 @@ void handleSerial() {
     Serial.print(F("CAL_FACTOR="));        Serial.println(CAL_FACTOR, 4);
     Serial.print(F("DWELL_S="));           Serial.println(DWELL_S);
     Serial.print(F("RETRACT_MM="));        Serial.println(RETRACT_MM, 3);
+    Serial.print(F("MAX_RETRACT_PCT="));   Serial.println(MAX_RETRACT_PCT, 1);
+    Serial.print(F("STARTUP_OFFSET_ML=")); Serial.println(STARTUP_OFFSET_ML, 3);
     Serial.print(F("STEPS_PER_REV="));     Serial.println(STEPS_PER_REV);
     Serial.print(F("LEADSCREW_LEAD_MM=")); Serial.println(LEADSCREW_LEAD_MM, 3);
     Serial.print(F("SYRINGE_ID_MM="));     Serial.println(SYRINGE_ID_MM, 3);
@@ -539,31 +593,48 @@ void handleSerial() {
     Serial.print(F("TRIGGER(D8)="));       Serial.println(digitalRead(PIN_TRIGGER) == LOW ? "LOW" : "HIGH");
     Serial.println(F("----------------"));
   } else {
-    Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, DWELL <s>, RETMM <mm>, GO, HOME, PURGE <ml>, RETRACT <ml>, STOP, RESUME, RESET"));
+    Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, DWELL <s>, RETMM <mm>, RETPCT <pct>, OFFSET <ml>, GO, HOME, PURGE <ml>, RETRACT <ml>, STOP, RESUME, RESET"));
   }
 
   Serial.println(F("OK"));
 }
 
-// Trigger detect (falling edge on D8 — pulled HIGH by INPUT_PULLUP, ground to trigger)
-// Ignores the first reading after boot to prevent false trigger if D8 is already LOW.
+// Trigger detect: requires a double-pulse pattern (ON-OFF-ON) within a time window.
+// The end GCode sends: M106 ON -> wait 1s -> M106 OFF -> wait 1s -> M106 ON -> wait 1s -> M106 OFF
+// Normal slicer fan control won't produce this specific pattern.
+const unsigned long PULSE_WINDOW_MS = 3000;  // both pulses must happen within this window
+
 bool triggerStartDetected() {
-  static bool last = digitalRead(PIN_TRIGGER);  // seed from actual pin state
-  static bool firstCall = true;
+  static bool lastState = false;
+  static unsigned long firstPulseTime = 0;
+  static uint8_t risingEdgeCount = 0;
+
   bool now = digitalRead(PIN_TRIGGER);
-  if (firstCall) {
-    firstCall = false;
-    last = now;
-    return false;  // never trigger on first call
-  }
-  if (now && !last) {
-    delay(TRIGGER_DEBOUNCE_MS);
-    if (digitalRead(PIN_TRIGGER)) {
-      last = now;
-      return true;
+
+  // Detect rising edge (LOW → HIGH)
+  if (now && !lastState) {
+    risingEdgeCount++;
+    if (risingEdgeCount == 1) {
+      firstPulseTime = millis();  // start the window
+    } else if (risingEdgeCount >= 2) {
+      // Got second pulse — check if within window
+      if (millis() - firstPulseTime <= PULSE_WINDOW_MS) {
+        risingEdgeCount = 0;  // reset for next time
+        return true;  // trigger!
+      } else {
+        // Too slow — restart counting from this pulse
+        risingEdgeCount = 1;
+        firstPulseTime = millis();
+      }
     }
   }
-  last = now;
+
+  // If window expired without second pulse, reset
+  if (risingEdgeCount > 0 && millis() - firstPulseTime > PULSE_WINDOW_MS) {
+    risingEdgeCount = 0;
+  }
+
+  lastState = now;
   return false;
 }
 
@@ -583,7 +654,7 @@ void setup() {
 
   Serial.begin(115200);
   Serial.println(F("Resin Dispenser Ready."));
-  Serial.println(F("Commands: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, GO, HOME, PURGE <ml>, RETRACT <ml>, RESET"));
+  Serial.println(F("Commands: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, OFFSET <ml>, GO, HOME, PURGE <ml>, RETRACT <ml>, RESET"));
   setState(STATE_IDLE);
 }
 

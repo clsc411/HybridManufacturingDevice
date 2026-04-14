@@ -344,6 +344,29 @@ class DispenseApp:
         tk.Label(left_frame, text="Plunger pullback after dwell (0 = off)",
                  fg="gray").grid(row=row, column=2, sticky="w", **pad)
 
+        row += 1
+        tk.Label(left_frame, text="Max retract (% of pour):").grid(
+            row=row, column=0, sticky="w", **pad)
+        self.retract_pct_var = tk.StringVar(value="10")
+        tk.Entry(left_frame, textvariable=self.retract_pct_var, width=8).grid(
+            row=row, column=1, sticky="w", **pad)
+        tk.Label(left_frame, text="Cap retract for small pours (0 = no cap)",
+                 fg="gray").grid(row=row, column=2, sticky="w", **pad)
+
+        # ── Small-Volume Compensation ────────────────────────────────
+        row += 1
+        tk.Label(left_frame, text="Small-Volume Fix", font=section_font).grid(
+            row=row, column=0, sticky="w", **pad)
+
+        row += 1
+        tk.Label(left_frame, text="Startup offset (mL):").grid(
+            row=row, column=0, sticky="w", **pad)
+        self.offset_ml_var = tk.StringVar(value="0.0")
+        tk.Entry(left_frame, textvariable=self.offset_ml_var, width=8).grid(
+            row=row, column=1, sticky="w", **pad)
+        tk.Label(left_frame, text="Extra mL to compensate backlash/compliance",
+                 fg="gray").grid(row=row, column=2, sticky="w", **pad)
+
         # ── Status Bar (spans full window width) ──────────────────────
         self.status_var = tk.StringVar(
             value="Ready. Purge tubing first, then load STL or enter volume.")
@@ -624,6 +647,20 @@ class DispenseApp:
             return max(val, 0.0)
         except ValueError:
             return 0.5
+
+    def _get_retract_pct(self):
+        try:
+            val = float(self.retract_pct_var.get())
+            return max(val, 0.0)
+        except ValueError:
+            return 10.0
+
+    def _get_offset_ml(self):
+        try:
+            val = float(self.offset_ml_var.get())
+            return max(val, 0.0)
+        except ValueError:
+            return 0.0
 
     def _toggle_stl_mode(self):
         """Show/hide wall thickness field based on STL mode selection."""
@@ -907,6 +944,8 @@ class DispenseApp:
         target = self.target_ml
         dwell_s = self._get_dwell_s()
         retract_mm = self._get_retract_mm()
+        retract_pct = self._get_retract_pct()
+        offset_ml = self._get_offset_ml()
 
         self._disable_buttons()
         self._set_status(f"Connecting to Arduino on {port}...")
@@ -937,6 +976,8 @@ class DispenseApp:
                         f"WAIT {wait_s}\n",
                         f"DWELL {dwell_s}\n",
                         f"RETMM {retract_mm:.2f}\n",
+                        f"RETPCT {retract_pct:.1f}\n",
+                        f"OFFSET {offset_ml:.2f}\n",
                         f"V {target:.2f}\n",
                     ]
                 else:
@@ -946,6 +987,8 @@ class DispenseApp:
                         "WAIT 0\n",
                         f"DWELL {dwell_s}\n",
                         f"RETMM {retract_mm:.2f}\n",
+                        f"RETPCT {retract_pct:.1f}\n",
+                        f"OFFSET {offset_ml:.2f}\n",
                         f"V {target:.2f}\n",
                     ]
 
@@ -1193,6 +1236,8 @@ class DispenseApp:
             pass
         dwell_s = self._get_dwell_s()
         retract_mm = self._get_retract_mm()
+        retract_pct = self._get_retract_pct()
+        offset_ml = self._get_offset_ml()
 
         self._disable_buttons()
         self._set_status("Sending override signal to Arduino...")
@@ -1222,6 +1267,8 @@ class DispenseApp:
                         f"WAIT {wait_s}\n",
                         f"DWELL {dwell_s}\n",
                         f"RETMM {retract_mm:.2f}\n",
+                        f"RETPCT {retract_pct:.1f}\n",
+                        f"OFFSET {offset_ml:.2f}\n",
                         f"V {self.target_ml:.2f}\n",
                         "OVERRIDE\n",
                     ]
@@ -1231,6 +1278,8 @@ class DispenseApp:
                         "WAIT 0\n",
                         f"DWELL {dwell_s}\n",
                         f"RETMM {retract_mm:.2f}\n",
+                        f"RETPCT {retract_pct:.1f}\n",
+                        f"OFFSET {offset_ml:.2f}\n",
                         f"V {self.target_ml:.2f}\n",
                         "OVERRIDE\n",
                     ]
