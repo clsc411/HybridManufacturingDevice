@@ -32,14 +32,34 @@ G1 X145 Y85.07 F3000 ;Extruder Y - 84.93mm to align mixing nozzle
 
 G4 S5          ; wait 5 seconds
 
-; Double-pulse trigger pattern for Arduino
-M106 P0 S255   ; pulse 1 ON
-G4 S1          ; hold 1 second
-M106 P0 S0     ; pulse 1 OFF
-G4 S1          ; wait 1 second
-M106 P0 S255   ; pulse 2 ON → Arduino triggers on this rising edge
-G4 S1          ; hold 1 second
-M106 P0 S0     ; OFF
+; 7-pulse trigger pattern for Arduino
+M106 P0 S255
+G4 S1
+M106 P0 S0
+G4 P500
+M106 P0 S255
+G4 P500
+M106 P0 S0
+G4 P500
+M106 P0 S255
+G4 P500
+M106 P0 S0
+G4 P500
+M106 P0 S255
+G4 P500
+M106 P0 S0
+G4 P500
+M106 P0 S255
+G4 P500
+M106 P0 S0
+G4 P500
+M106 P0 S255
+G4 P500
+M106 P0 S0
+G4 P500
+M106 P0 S255
+G4 P500
+M106 P0 S0
 
 
 ;Disable steppers except Z
