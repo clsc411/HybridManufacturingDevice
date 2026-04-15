@@ -1,9 +1,9 @@
 # ResinNozzlePosition.py — Cura Post-Processing Script
 #
 # Auto-positions the mixing nozzle over the center of the printed mold
-# for resin dispensing. Reads the print bounding box from Cura's G-code
-# header (;MINX, ;MAXX, etc.), applies the Y offset for the mixing nozzle,
-# and raises Z for clearance.
+# for resin dispensing. Scans G-code moves filtered by Cura's ;TYPE:
+# annotations to find the model geometry bounds (excluding skirt/brim),
+# applies the Y offset for the mixing nozzle, and raises Z for clearance.
 #
 # Installation:
 #   Copy this file to your Cura scripts folder:
@@ -77,73 +77,58 @@ class ResinNozzlePosition(Script):
         travel_speed = self.getSettingValueByKey("travel_speed")
         z_speed = self.getSettingValueByKey("z_speed")
 
-        # --- Read print bounding box from Cura's G-code header ---
-        # Cura writes ;MINX, ;MAXX, ;MINY, ;MAXY, ;MAXZ comments in the
-        # header. These reflect the actual print bounds and exclude purge
-        # lines, skirt moves outside the model, and start/end G-code moves.
-        min_x = None
-        max_x = None
-        min_y = None
-        max_y = None
-        max_z = None
+        # --- Find model bounding box by scanning G-code moves ---
+        # Cura annotates each section with ;TYPE: comments. We only count
+        # model geometry (walls, skin, fill) and skip skirt/brim/support,
+        # which can extend far beyond the actual mold and skew the center.
+        MODEL_TYPES = {"WALL-OUTER", "WALL-INNER", "SKIN", "FILL"}
 
-        for line in data[0].split("\n"):
-            stripped = line.strip()
-            if stripped.startswith(";MINX:"):
-                min_x = float(stripped.split(":")[1])
-            elif stripped.startswith(";MAXX:"):
-                max_x = float(stripped.split(":")[1])
-            elif stripped.startswith(";MINY:"):
-                min_y = float(stripped.split(":")[1])
-            elif stripped.startswith(";MAXY:"):
-                max_y = float(stripped.split(":")[1])
-            elif stripped.startswith(";MAXZ:"):
-                max_z = float(stripped.split(":")[1])
+        min_x = float('inf')
+        max_x = float('-inf')
+        min_y = float('inf')
+        max_y = float('-inf')
+        max_z = 0.0
+        current_type = None
+        current_z = 0.0
 
-        # If header bounds not found, fall back to scanning layer moves
-        if any(v is None for v in [min_x, max_x, min_y, max_y, max_z]):
-            min_x = float('inf')
-            max_x = float('-inf')
-            min_y = float('inf')
-            max_y = float('-inf')
-            max_z = 0.0
-            in_layer = False
+        for layer in data:
+            for line in layer.split("\n"):
+                stripped = line.strip()
 
-            for layer_index in range(len(data)):
-                for line in data[layer_index].split("\n"):
-                    stripped = line.strip()
+                # Track which type of geometry we're in
+                if stripped.startswith(";TYPE:"):
+                    current_type = stripped[6:]
+                    continue
 
-                    # Only start counting after we see a ;LAYER: marker
-                    # to skip purge lines in the start G-code
-                    if stripped.startswith(";LAYER:"):
-                        in_layer = True
-                        continue
-
-                    # Stop counting if we hit end G-code markers
-                    if stripped.startswith(";END") or stripped == "G91":
-                        in_layer = False
-
-                    if not in_layer:
-                        continue
-
-                    if not re.match(r'G[01]\s', stripped):
-                        continue
-
-                    x_match = re.search(r'X([-\d.]+)', stripped)
-                    y_match = re.search(r'Y([-\d.]+)', stripped)
+                # Track Z position across all moves
+                if re.match(r'G[01]\s', stripped):
                     z_match = re.search(r'Z([-\d.]+)', stripped)
-
-                    if x_match:
-                        min_x = min(min_x, float(x_match.group(1)))
-                        max_x = max(max_x, float(x_match.group(1)))
-                    if y_match:
-                        min_y = min(min_y, float(y_match.group(1)))
-                        max_y = max(max_y, float(y_match.group(1)))
                     if z_match:
-                        max_z = max(max_z, float(z_match.group(1)))
+                        current_z = float(z_match.group(1))
 
-            if min_x == float('inf') or min_y == float('inf') or max_z == 0:
-                return data
+                # Only measure XY bounds for model geometry moves
+                if current_type not in MODEL_TYPES:
+                    continue
+
+                if not re.match(r'G[01]\s', stripped):
+                    continue
+
+                x_match = re.search(r'X([-\d.]+)', stripped)
+                y_match = re.search(r'Y([-\d.]+)', stripped)
+
+                if x_match:
+                    x = float(x_match.group(1))
+                    min_x = min(min_x, x)
+                    max_x = max(max_x, x)
+                if y_match:
+                    y = float(y_match.group(1))
+                    min_y = min(min_y, y)
+                    max_y = max(max_y, y)
+                if x_match or y_match:
+                    max_z = max(max_z, current_z)
+
+        if min_x == float('inf') or min_y == float('inf') or max_z == 0:
+            return data
 
         # --- Compute target positions ---
         center_x = (min_x + max_x) / 2.0
