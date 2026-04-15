@@ -1,11 +1,19 @@
-G28            ; home first (safety)
-G4 S5          ; wait 5 seconds
+G91   ;Relative positioning
+G1 E-2 F2700  ;Retract a bit
+G1 E-2 Z0.2 F2400  ;Retract and raise Z
+G1 Z3.0 ;Raise Z more
+G90  ;Absolute positioning
 
-; Double-pulse trigger pattern for Arduino
-M106 P0 S255   ; pulse 1 ON
-G4 S1          ; hold 1 second
-M106 P0 S0     ; pulse 1 OFF
-G4 S1          ; wait 1 second
-M106 P0 S255   ; pulse 2 ON → Arduino triggers on this rising edge
-G4 S1          ; hold 1 second
-M106 P0 S0     ; OFF
+;Shut down heaters and fan
+M106 S0  ;Turn off fan
+M104 S0  ;Turn off hotend
+M140 S0 ;Turn off bed
+
+;Wait 5 minutes for mold to settle
+;REMOVE THIS COMMENT WHEN IN PRODUCTION
+;G4 S300 ;Dwell 5 minutes
+
+;The ResinNozzlePosition post-processing script replaces this marker
+;with auto-computed positioning: Z clearance, XY center over mold,
+;nozzle Y offset, dwell, and M118 DISPENSE_NOW trigger.
+;RESIN_NOZZLE_POSITION

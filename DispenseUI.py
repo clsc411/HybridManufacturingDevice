@@ -47,6 +47,11 @@ class DispenseApp:
         self._serial_lock = threading.Lock()  # prevent concurrent serial access
         self._cancel_event = threading.Event()  # signal running ops to abort
 
+        # Printer monitor state (USB trigger — separate serial connection)
+        self._printer_ser = None
+        self._printer_monitoring = False
+        self._monitor_thread = None
+
         # Computed values (set after STL load)
         self.cavity_ml = None
         self.outer_ml = None
@@ -104,6 +109,12 @@ class DispenseApp:
         ctrl_frame = tk.LabelFrame(right_frame, text="Process Control", font=section_font)
         ctrl_frame.pack(side="top", pady=(8, 0), fill="x")
         self._setup_process_controls(ctrl_frame)
+
+        # ── Printer Monitor (USB Trigger) ────────────────────────────
+        printer_frame = tk.LabelFrame(right_frame, text="Printer Monitor (USB Trigger)",
+                                      font=section_font)
+        printer_frame.pack(side="top", pady=(8, 0), fill="x")
+        self._setup_printer_monitor(printer_frame)
 
         # ── STL Mode ───────────────────────────────────────────────────
         row = 0
@@ -614,6 +625,242 @@ class DispenseApp:
             "Reset sent. Connection will refresh on next command.",
             color="green")
         self._enable_buttons()
+
+    # ── Printer Monitor (USB Trigger) ─────────────────────────────────
+
+    def _setup_printer_monitor(self, parent):
+        """UI for monitoring the printer's serial port for a trigger keyword.
+
+        When the printer's end G-code sends ``M118 DISPENSE_NOW``, this
+        monitor catches it and automatically sends GO to the Arduino.
+        Requires printing from SD card (so the printer's USB serial is free).
+        """
+        row1 = tk.Frame(parent)
+        row1.pack(fill="x", padx=6, pady=4)
+
+        tk.Label(row1, text="Printer Port:").pack(side="left")
+        self.printer_port_var = tk.StringVar(value="COM3")
+        tk.Entry(row1, textvariable=self.printer_port_var, width=8).pack(
+            side="left", padx=4)
+
+        tk.Label(row1, text="Trigger:").pack(side="left", padx=(8, 0))
+        self.trigger_keyword_var = tk.StringVar(value="DISPENSE_NOW")
+        tk.Entry(row1, textvariable=self.trigger_keyword_var, width=16).pack(
+            side="left", padx=4)
+
+        row2 = tk.Frame(parent)
+        row2.pack(fill="x", padx=6, pady=4)
+
+        self.monitor_btn = tk.Button(
+            row2, text="Start Monitoring", command=self._toggle_monitor,
+            bg="#607D8B", fg="white", height=1, width=18)
+        self.monitor_btn.pack(side="left", padx=4)
+
+        self._monitor_status_var = tk.StringVar(value="Not monitoring")
+        tk.Label(parent, textvariable=self._monitor_status_var, fg="#555",
+                 font=("TkDefaultFont", 8)).pack(anchor="w", padx=6, pady=(0, 4))
+
+        tk.Label(parent, text="Print from SD card so printer USB is free",
+                 fg="gray", font=("TkDefaultFont", 7)).pack(
+            anchor="w", padx=6, pady=(0, 4))
+
+    def _toggle_monitor(self):
+        if self._printer_monitoring:
+            self._stop_monitor()
+        else:
+            self._start_monitor()
+
+    def _start_monitor(self):
+        printer_port = self.printer_port_var.get().strip()
+        if not printer_port:
+            self._monitor_status_var.set("No printer port specified")
+            return
+
+        if self.target_ml is None:
+            self._set_status(
+                "Set a target volume first (Send to Arduino), then start monitoring.",
+                color="red")
+            return
+
+        try:
+            self._printer_ser = pyserial.Serial(printer_port, 115200, timeout=1)
+        except Exception as e:
+            self._monitor_status_var.set(f"Failed to open port")
+            self._set_status(
+                f"Cannot open printer port {printer_port}: {e}", color="red")
+            return
+
+        self._printer_monitoring = True
+        self.monitor_btn.config(text="Stop Monitoring", bg="#F44336")
+        self._monitor_status_var.set(
+            f"Monitoring {printer_port} for trigger...")
+        self._set_status(
+            f"Monitoring printer on {printer_port}. Start your print from SD card.",
+            color="#1565C0")
+
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+
+    def _stop_monitor(self):
+        self._printer_monitoring = False
+        if self._printer_ser is not None:
+            try:
+                self._printer_ser.close()
+            except Exception:
+                pass
+            self._printer_ser = None
+        self.monitor_btn.config(text="Start Monitoring", bg="#607D8B")
+        self._monitor_status_var.set("Not monitoring")
+
+    def _monitor_loop(self):
+        """Background thread: read printer serial, watch for trigger keyword."""
+        keyword = self.trigger_keyword_var.get().strip()
+        while self._printer_monitoring:
+            try:
+                if self._printer_ser is None or not self._printer_ser.is_open:
+                    break
+                line = self._printer_ser.readline().decode(
+                    errors="replace").strip()
+                if not line:
+                    continue
+                if keyword in line:
+                    self.root.after(0, self._on_printer_trigger)
+                    return  # exit cleanly — trigger handled
+            except Exception:
+                break
+
+        # Exited unexpectedly (not via _stop_monitor or trigger)
+        if self._printer_monitoring:
+            self._printer_monitoring = False
+            self.root.after(0, lambda: (
+                self.monitor_btn.config(
+                    text="Start Monitoring", bg="#607D8B"),
+                self._monitor_status_var.set("Monitor disconnected"),
+            ))
+
+    def _on_printer_trigger(self):
+        """Called on the main thread when the printer sends the trigger."""
+        self._stop_monitor()
+        self._monitor_status_var.set("TRIGGER RECEIVED — dispensing...")
+        self._set_status(
+            "Printer trigger received! Sending GO to Arduino...",
+            color="#D84315")
+
+        if self.target_ml is None:
+            self._monitor_status_var.set("Dispense failed")
+            self._set_status(
+                "Trigger received but no target volume set!", color="red")
+            return
+
+        port = self.port_var.get().strip()
+        target = self.target_ml
+        staged = None
+        try:
+            staged = self._get_staged_params()
+        except ValueError:
+            pass
+        dwell_s = self._get_dwell_s()
+        retract_mm = self._get_retract_mm()
+        retract_pct = self._get_retract_pct()
+        offset_ml = self._get_offset_ml()
+
+        # Send full command sequence (like Override) to ensure clean state
+        def do_trigger():
+            if not self._serial_lock.acquire(timeout=5):
+                self.root.after(0, lambda: self._on_auto_dispense_error(
+                    "Serial port busy — another operation is running."))
+                return
+            try:
+                # Force a fresh connection so the Arduino resets cleanly
+                self._close_serial()
+                ser = self._ensure_serial(port=port, timeout=120)
+
+                # Build command sequence: configure then GO
+                if staged:
+                    seg_ml, wait_s = staged
+                    cmds = [
+                        f"SEG {seg_ml:.2f}\n",
+                        f"WAIT {wait_s}\n",
+                    ]
+                else:
+                    cmds = [
+                        "SEG 0\n",
+                        "WAIT 0\n",
+                    ]
+                cmds += [
+                    f"DWELL {dwell_s}\n",
+                    f"RETMM {retract_mm:.2f}\n",
+                    f"RETPCT {retract_pct:.1f}\n",
+                    f"OFFSET {offset_ml:.2f}\n",
+                    f"V {target:.2f}\n",
+                    "GO\n",
+                ]
+
+                response_lines = []
+                for cmd in cmds:
+                    ser.write(cmd.encode())
+                    while True:
+                        if self._cancel_event.is_set():
+                            raise RuntimeError("Cancelled by user")
+                        line = ser.readline().decode().strip()
+                        if line:
+                            response_lines.append(line)
+                        if line == "OK":
+                            break
+                        if line == "":
+                            raise RuntimeError("Arduino did not respond (timeout)")
+
+                print("[Auto-dispense serial log]")
+                for l in response_lines:
+                    print(f"  << {l}")
+
+                self.root.after(0, lambda: self._on_auto_dispense_success(
+                    response_lines))
+            except Exception as e:
+                self._on_serial_error()
+                self.root.after(0, lambda e=e: self._on_auto_dispense_error(
+                    str(e)))
+            finally:
+                self._serial_lock.release()
+
+        threading.Thread(target=do_trigger, daemon=True).start()
+
+    def _on_auto_dispense_success(self, lines):
+        done = any("DONE" in l for l in lines)
+        paused = any("PAUSED" in l for l in lines)
+        aborted = any("ABORTED" in l or "Aborted" in l for l in lines)
+        limit = any("LIMIT" in l for l in lines)
+        # Log full Arduino response for debugging
+        print("[Auto-dispense response]")
+        for l in lines:
+            print(f"  << {l}")
+        if done:
+            self._monitor_status_var.set("Dispense complete")
+            self._set_status(
+                "Auto-dispense complete! Print + pour cycle finished.",
+                color="green")
+        elif aborted or limit:
+            detail = next((l for l in lines if "LIMIT" in l or "Aborted" in l), "unknown")
+            self._monitor_status_var.set("Dispense ABORTED")
+            self._proc_status_var.set("Process ABORTED — send Reset")
+            self._set_status(
+                f"Auto-dispense aborted: {detail}", color="red")
+        elif paused:
+            self._proc_status_var.set("Process PAUSED")
+            self._monitor_status_var.set("Dispense paused")
+            self._set_status(
+                "Dispense paused. Use Resume to continue.", color="#D84315")
+        else:
+            # Fallthrough — log what we got so we can debug
+            self._monitor_status_var.set("Dispense sent (no DONE received)")
+            self._set_status(
+                f"GO sent but no DONE received. Arduino said: {'; '.join(lines)}",
+                color="#D84315")
+
+    def _on_auto_dispense_error(self, msg):
+        self._monitor_status_var.set("Dispense failed")
+        self._set_status(f"Auto-dispense failed: {msg}", color="red")
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -1350,6 +1597,7 @@ def main():
     root.mainloop()
 
 def _cleanup(app):
+    app._stop_monitor()
     app._close_serial()
 
 
