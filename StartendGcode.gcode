@@ -28,39 +28,12 @@ M140 S0 ;Turn off bed
 ;G4 S300 ;Dwell 5 minutes
 
 ;Position mixing nozzle over mold center
-G1 X145 Y85.07 F3000 ;Extruder Y - 84.93mm to align mixing nozzle
+G1 X145 Y72 F3000 ;Extruder Y = 150 - 78mm nozzle offset
 
 G4 S5          ; wait 5 seconds
 
-; 7-pulse trigger pattern for Arduino
-M106 P0 S255
-G4 S1
-M106 P0 S0
-G4 P500
-M106 P0 S255
-G4 P500
-M106 P0 S0
-G4 P500
-M106 P0 S255
-G4 P500
-M106 P0 S0
-G4 P500
-M106 P0 S255
-G4 P500
-M106 P0 S0
-G4 P500
-M106 P0 S255
-G4 P500
-M106 P0 S0
-G4 P500
-M106 P0 S255
-G4 P500
-M106 P0 S0
-G4 P500
-M106 P0 S255
-G4 P500
-M106 P0 S0
-
+; Trigger Arduino via USB serial (DispenseUI monitors for this keyword)
+M118 DISPENSE_NOW
 
 ;Disable steppers except Z
 M84 X Y E

@@ -8,7 +8,9 @@
     5V -> PUL+, DIR+, ENA+ (daisy-chained)
 
   TRIGGER:
-    D8 -> "DISPENSE_NOW" (HIGH = start). Current DAR diagram shows 12V->3.3V converter into D8.
+    USB serial only. The PC runs DispenseUI.py which monitors the printer's
+    USB port for "M118 DISPENSE_NOW" in the end G-code, then sends GO to
+    this Arduino over its own USB serial connection.
 
   LIMIT SWITCHES (NO contacts, wired to GND):
     D3 -> fully extended end stop
@@ -40,9 +42,8 @@
 const uint8_t PIN_STEP      = 4;   // PUL-  (D4)
 const uint8_t PIN_DIR       = 6;   // DIR-  (D6)
 const uint8_t PIN_EN        = 7;   // ENA+  (D7)
-const uint8_t PIN_TRIGGER   = 8;   // start signal from printer (now wired)
-const uint8_t PIN_LIMIT_EXT = 3;  // D3 - fully extended end stop (now wired)
-const uint8_t PIN_LIMIT_RET = 5;  // D5 - fully retracted / home (now wired)
+const uint8_t PIN_LIMIT_EXT = 3;   // D3 - fully extended end stop
+const uint8_t PIN_LIMIT_RET = 5;   // D5 - fully retracted / home
 const uint8_t PIN_LED       = 13;  // built-in LED - state indicator
 
 // ---------------- MOTION / MECH PARAMS ----------------
@@ -101,9 +102,6 @@ float STARTUP_OFFSET_ML = 0.0f;
 // sucks mixed resin back from the nozzle into the A/B lines.
 unsigned long DWELL_S = 0;
 
-// Debounce / trigger behavior
-const unsigned long TRIGGER_DEBOUNCE_MS = 50;
-
 const long STEPS_PER_REV = MOTOR_FULL_STEPS_PER_REV * MICROSTEPS;
 
 // ---------------- STATE (PR-05) ----------------
@@ -111,7 +109,6 @@ enum DispenseState { STATE_IDLE, STATE_POURING, STATE_DONE, STATE_ABORTED, STATE
 DispenseState g_state = STATE_IDLE;
 bool g_aborted = false;
 volatile bool g_stopRequested = false;
-bool g_triggerArmed = false;  // D8 trigger ignored until user sends volume via UI
 
 // Pause/resume tracking — saves position mid-dispense
 float g_effectiveTotalMl = 0.0f;  // total effective mL for current dispense (for retract cap)
@@ -524,7 +521,6 @@ void handleSerial() {
 
   if (startsWith("V ")) {
     TARGET_TOTAL_ML = line.substring(2).toFloat();
-    g_triggerArmed = true;  // arm D8 trigger after user sets volume
   } else if (startsWith("SEG ")) {
     SEGMENT_ML = line.substring(4).toFloat();
   } else if (startsWith("WAIT ")) {
@@ -590,7 +586,6 @@ void handleSerial() {
     Serial.print(F("VOLUME_IS_TOTAL_MIXED=")); Serial.println(VOLUME_IS_TOTAL_MIXED ? "true" : "false");
     Serial.print(F("LIMIT_EXT(D3)="));     Serial.println(digitalRead(PIN_LIMIT_EXT) == LOW ? "TRIGGERED" : "open");
     Serial.print(F("LIMIT_RET(D5)="));     Serial.println(digitalRead(PIN_LIMIT_RET) == LOW ? "TRIGGERED" : "open");
-    Serial.print(F("TRIGGER(D8)="));       Serial.println(digitalRead(PIN_TRIGGER) == LOW ? "LOW" : "HIGH");
     Serial.println(F("----------------"));
   } else {
     Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, DWELL <s>, RETMM <mm>, RETPCT <pct>, OFFSET <ml>, GO, HOME, PURGE <ml>, RETRACT <ml>, STOP, RESUME, RESET"));
@@ -599,50 +594,10 @@ void handleSerial() {
   Serial.println(F("OK"));
 }
 
-// Trigger detect: requires a double-pulse pattern (ON-OFF-ON) within a time window.
-// The end GCode sends: M106 ON -> wait 1s -> M106 OFF -> wait 1s -> M106 ON -> wait 1s -> M106 OFF
-// Normal slicer fan control won't produce this specific pattern.
-const unsigned long PULSE_WINDOW_MS = 3000;  // both pulses must happen within this window
-
-bool triggerStartDetected() {
-  static bool lastState = false;
-  static unsigned long firstPulseTime = 0;
-  static uint8_t risingEdgeCount = 0;
-
-  bool now = digitalRead(PIN_TRIGGER);
-
-  // Detect rising edge (LOW → HIGH)
-  if (now && !lastState) {
-    risingEdgeCount++;
-    if (risingEdgeCount == 1) {
-      firstPulseTime = millis();  // start the window
-    } else if (risingEdgeCount >= 2) {
-      // Got second pulse — check if within window
-      if (millis() - firstPulseTime <= PULSE_WINDOW_MS) {
-        risingEdgeCount = 0;  // reset for next time
-        return true;  // trigger!
-      } else {
-        // Too slow — restart counting from this pulse
-        risingEdgeCount = 1;
-        firstPulseTime = millis();
-      }
-    }
-  }
-
-  // If window expired without second pulse, reset
-  if (risingEdgeCount > 0 && millis() - firstPulseTime > PULSE_WINDOW_MS) {
-    risingEdgeCount = 0;
-  }
-
-  lastState = now;
-  return false;
-}
-
 void setup() {
   pinMode(PIN_STEP,      OUTPUT);
   pinMode(PIN_DIR,       OUTPUT);
   pinMode(PIN_EN,        OUTPUT);
-  pinMode(PIN_TRIGGER,   INPUT);            // pulled LOW by external 1k resistor; KFAN2 signal pulls HIGH to trigger
   pinMode(PIN_LIMIT_EXT, INPUT_PULLUP);    // NO switch to GND: HIGH=open, LOW=triggered
   pinMode(PIN_LIMIT_RET, INPUT_PULLUP);    // NO switch to GND: HIGH=open, LOW=triggered
   pinMode(PIN_LED,       OUTPUT);
@@ -683,10 +638,5 @@ void loop() {
       lastPauseBlink = millis();
     }
     return;
-  }
-
-  if (g_state == STATE_IDLE && g_triggerArmed && triggerStartDetected()) {
-    Serial.println(F("TRIGGER received on D8 -> starting dispense..."));
-    dispenseTotalMl(TARGET_TOTAL_ML);
   }
 }
