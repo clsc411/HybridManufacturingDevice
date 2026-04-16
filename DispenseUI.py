@@ -29,7 +29,7 @@ DEFAULT_PORT      = "COM5"
 DEFAULT_BAUD      = 115200
 DEFAULT_OVERFILL  = 0.0    # percent
 DEFAULT_PURGE_ML  = 10.0   # mL to push through tubing during purge
-NOZZLE_DEAD_ML    = 0.374  # mixing nozzle dead volume (374.17 mm³)
+NOZZLE_DEAD_ML    = 2.0  # mixing nozzle volume (374.17 mm³)
 
 # Conversion factors to millimeters (STL files may use different units)
 UNIT_TO_MM = {"mm": 1.0, "cm": 10.0, "in": 25.4, "m": 1000.0}
