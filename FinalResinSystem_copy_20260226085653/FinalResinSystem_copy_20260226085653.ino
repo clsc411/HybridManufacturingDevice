@@ -55,7 +55,7 @@ const float LEADSCREW_LEAD_MM = 2.0f;
 const float SYRINGE_ID_MM = 50.8f;
 
 // Calibration factor 1.02 was used in last sem testing.
-float CAL_FACTOR = 0.55f;
+float CAL_FACTOR = 0.65f;
 
 // If target volume is TOTAL mixed output (A+B), keep this true.
 // If instead we want "per syringe" volume, set false.
@@ -94,7 +94,7 @@ float MAX_RETRACT_PCT = 10.0f;
 // pressurisation.  Negligible at large volumes but significant at
 // small ones.  Tune empirically: dispense a known small volume into a
 // graduated container and increase this until the output matches.
-float STARTUP_OFFSET_ML = 0.0f;
+float STARTUP_OFFSET_ML = 1.6f;
 
 // Post-dispense dwell: seconds to hold motor enabled (holding torque)
 // after the last segment finishes but BEFORE the anti-drip retract.

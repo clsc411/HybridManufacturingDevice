@@ -29,7 +29,7 @@ DEFAULT_PORT      = "COM5"
 DEFAULT_BAUD      = 115200
 DEFAULT_OVERFILL  = 0.0    # percent
 DEFAULT_PURGE_ML  = 10.0   # mL to push through tubing during purge
-NOZZLE_DEAD_ML    = 2.0  # mixing nozzle volume (374.17 mm³)
+NOZZLE_DEAD_ML    = 2.0  # mixing nozzle volume (3.2 mm radius, 70 mm length³)
 
 # Conversion factors to millimeters (STL files may use different units)
 UNIT_TO_MM = {"mm": 1.0, "cm": 10.0, "in": 25.4, "m": 1000.0}
@@ -509,7 +509,7 @@ class DispenseApp:
                  font=("TkDefaultFont", 8)).pack(anchor="w", padx=6, pady=(0, 4))
 
     def _send_simple_command(self, cmd, on_success, on_error, status_msg,
-                             timeout=10):
+                             timeout=None):
         """Send a single command to Arduino in a background thread."""
         port = self.port_var.get().strip()
         self._set_status(status_msg)
@@ -572,17 +572,12 @@ class DispenseApp:
             self._set_status(f"Stop failed: {e}", color="red")
 
     def _process_resume(self):
-        """Send RESUME to continue a paused dispense.
-
-        Uses a 120-second timeout because RESUME triggers the remaining
-        dispense, which can take minutes to complete.
-        """
+        """Send RESUME to continue a paused dispense."""
         self._send_simple_command(
             "RESUME",
             on_success=self._on_resume_success,
             on_error=self._on_resume_error,
-            status_msg="Sending RESUME to Arduino...",
-            timeout=120)
+            status_msg="Sending RESUME to Arduino...")
 
     def _on_resume_success(self, lines):
         done = any("DONE" in l for l in lines)
@@ -774,7 +769,7 @@ class DispenseApp:
             try:
                 # Force a fresh connection so the Arduino resets cleanly
                 self._close_serial()
-                ser = self._ensure_serial(port=port, timeout=120)
+                ser = self._ensure_serial(port=port)
 
                 # Build command sequence: configure then GO
                 if staged:
@@ -951,10 +946,11 @@ class DispenseApp:
 
     # ── Persistent serial connection ────────────────────────────────────
 
-    def _ensure_serial(self, port=None, timeout=120):
+    def _ensure_serial(self, port=None, timeout=None):
         """Return an open serial connection, reusing the existing one if
         possible.  Only the first call pays the 2-second Arduino boot cost.
-        `port` must be read on the main thread and passed in."""
+        `port` must be read on the main thread and passed in.
+        timeout=None means block until data arrives (no timeout)."""
         if port is None:
             port = self._ser_port or "COM5"
 
