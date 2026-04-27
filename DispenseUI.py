@@ -356,12 +356,12 @@ class DispenseApp:
                  fg="gray").grid(row=row, column=2, sticky="w", **pad)
 
         row += 1
-        tk.Label(left_frame, text="Max retract (% of pour):").grid(
+        tk.Label(left_frame, text="Retract (% of pour):").grid(
             row=row, column=0, sticky="w", **pad)
-        self.retract_pct_var = tk.StringVar(value="10")
+        self.retract_pct_var = tk.StringVar(value="50")
         tk.Entry(left_frame, textvariable=self.retract_pct_var, width=8).grid(
             row=row, column=1, sticky="w", **pad)
-        tk.Label(left_frame, text="Cap retract for small pours (0 = no cap)",
+        tk.Label(left_frame, text="Retract this % of pour travel (0 = use fixed mm)",
                  fg="gray").grid(row=row, column=2, sticky="w", **pad)
 
         # ── Small-Volume Compensation ────────────────────────────────
@@ -895,7 +895,7 @@ class DispenseApp:
             val = float(self.retract_pct_var.get())
             return max(val, 0.0)
         except ValueError:
-            return 10.0
+            return 50.0
 
     def _get_offset_ml(self):
         try:

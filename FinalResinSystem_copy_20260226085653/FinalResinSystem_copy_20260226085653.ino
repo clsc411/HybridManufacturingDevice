@@ -54,8 +54,9 @@ const float LEADSCREW_LEAD_MM = 2.0f;
 // Syringes: internal diameter (mm)
 const float SYRINGE_ID_MM = 50.8f;
 
-// Calibration factor 1.02 was used in last sem testing.
-float CAL_FACTOR = 0.65f;
+// Calibration factor. Starting from 0.9 after installing one-way valves
+// and re-tuning from the top. Dial down if over-dispensing.
+float CAL_FACTOR = 0.71f;
 
 // If target volume is TOTAL mixed output (A+B), keep this true.
 // If instead we want "per syringe" volume, set false.
@@ -78,16 +79,23 @@ const bool ENABLE_ACTIVE_HIGH = true;
 // Pick which way is "dispense" vs "retract"
 const bool DIR_DISPENSE_LEVEL = LOW;
 
-// Anti-drip retract at end (mm). Set 0 to disable.
+// Fixed-mm retract fallback. Used by purge/manual retract, and by the
+// post-dispense anti-drip retract ONLY when RETRACT_PCT is 0.
 float RETRACT_MM = 0.5f;
 
-// Max retract as % of dispense travel — prevents the retract from
-// pulling back a huge fraction of the pour at small volumes.
-// At 8 mL with CAL 0.55 the dispense travel is only ~1.1 mm, so a
-// 0.5 mm retract would be 46% of the pour.  Capping at 10% keeps
-// the retract proportional.  Set 0 to disable the cap (always use
-// full RETRACT_MM).
-float MAX_RETRACT_PCT = 10.0f;
+// Post-dispense retract as % of the pour travel. With one-way valves
+// installed (Apr 2026) we can retract aggressively to break flow
+// without risk of sucking cured resin back into the syringes. At
+// RETRACT_PCT=50 a 20 mL pour retracts ~10 mL of fluid. Set 0 to fall
+// back to the fixed RETRACT_MM value.
+float RETRACT_PCT = 15.0f;
+
+// Hard cap on the post-dispense retract volume (mL). At large pour
+// sizes a percent-based retract can pull enough fluid back that air
+// leaks past the syringe plunger seals — undersizing the next pour.
+// This cap limits the retract regardless of pour size. Set 0 to
+// disable the cap.
+float MAX_RETRACT_ML = 10.0f;
 
 // Fixed volume offset (mL) added to every dispense to compensate for
 // startup losses — leadscrew backlash, plunger compliance, line
@@ -169,13 +177,23 @@ long stepsForTravelMm(float travelMm) {
   return (long)(revs * (float)STEPS_PER_REV + 0.5f);
 }
 
-// Compute the effective retract distance (mm), capped so it never
-// exceeds MAX_RETRACT_PCT of the dispense travel.
-float cappedRetractMm(float pourTravelMm) {
-  if (RETRACT_MM <= 0.0f) return 0.0f;
-  if (MAX_RETRACT_PCT <= 0.0f) return RETRACT_MM;  // cap disabled
-  float maxRet = pourTravelMm * (MAX_RETRACT_PCT / 100.0f);
-  return (RETRACT_MM < maxRet) ? RETRACT_MM : maxRet;
+// Compute post-dispense retract travel (mm). Primary driver is
+// RETRACT_PCT — a percentage of the pour travel. Falls back to the
+// fixed RETRACT_MM when RETRACT_PCT is 0. Final result is capped at
+// MAX_RETRACT_ML (converted to travel via the same CAL convention as
+// dispense), so big pours don't over-retract and unseal the plungers.
+float retractTravelForPour(float pourTravelMm) {
+  float retractMm;
+  if (RETRACT_PCT > 0.0f) {
+    retractMm = pourTravelMm * (RETRACT_PCT / 100.0f);
+  } else {
+    retractMm = (RETRACT_MM > 0.0f) ? RETRACT_MM : 0.0f;
+  }
+  if (MAX_RETRACT_ML > 0.0f) {
+    float capMm = travelMmForTotalMl(MAX_RETRACT_ML);
+    if (retractMm > capMm) retractMm = capMm;
+  }
+  return retractMm;
 }
 
 // ---------------- MOTION ----------------
@@ -407,15 +425,15 @@ void dispenseTotalMl(float totalMl) {
       }
     }
 
-    // Anti-drip retract (capped so it can't dominate small pours)
+    // Post-dispense retract (percent of pour travel)
     float pourTravelMm = travelMmForTotalMl(effective);
-    float retMm = cappedRetractMm(pourTravelMm);
+    float retMm = retractTravelForPour(pourTravelMm);
     if (!g_aborted && !g_stopRequested && retMm > 0.0f) {
       long rSteps = stepsForTravelMm(retMm);
       Serial.print(F("Retract mm: ")); Serial.print(retMm, 3);
-      if (retMm < RETRACT_MM) {
-        Serial.print(F(" (capped from ")); Serial.print(RETRACT_MM, 3);
-        Serial.print(F(")"));
+      if (RETRACT_PCT > 0.0f) {
+        Serial.print(F(" (")); Serial.print(RETRACT_PCT, 1);
+        Serial.print(F("% of pour)"));
       }
       Serial.print(F(" | steps: ")); Serial.println(rSteps);
       setEnable(true);
@@ -475,9 +493,9 @@ void resumeDispense() {
         if (g_stopRequested || g_aborted) break;
       }
     }
-    // Anti-drip retract (capped, same as dispenseTotalMl)
+    // Post-dispense retract (same as dispenseTotalMl)
     float pourTravelMm = travelMmForTotalMl(g_effectiveTotalMl);
-    float retMm = cappedRetractMm(pourTravelMm);
+    float retMm = retractTravelForPour(pourTravelMm);
     if (!g_aborted && !g_stopRequested && retMm > 0.0f) {
       long rSteps = stepsForTravelMm(retMm);
       setEnable(true);
@@ -499,8 +517,9 @@ void resumeDispense() {
 //   RPM 30      -> set motor RPM
 //   CAL 1.02    -> set calibration factor
 //   DWELL 5     -> set post-dispense dwell seconds (pressure equalize)
-//   RETMM 1.0   -> set anti-drip retract distance (mm)
-//   RETPCT 10   -> set max retract as % of pour travel (0 = no cap)
+//   RETMM 1.0   -> set fallback retract distance (mm, used if RETPCT=0)
+//   RETPCT 50   -> set post-dispense retract as % of pour travel (0 = use RETMM)
+//   RETMAX 10   -> hard cap on retract volume (mL, 0 = no cap)
 //   OFFSET 2.0  -> set startup volume offset (mL) for backlash compensation
 //   GO          -> start dispensing
 //   HOME        -> retract to home (retract limit switch)
@@ -534,7 +553,9 @@ void handleSerial() {
   } else if (startsWith("RETMM ")) {
     RETRACT_MM = line.substring(6).toFloat();
   } else if (startsWith("RETPCT ")) {
-    MAX_RETRACT_PCT = line.substring(7).toFloat();
+    RETRACT_PCT = line.substring(7).toFloat();
+  } else if (startsWith("RETMAX ")) {
+    MAX_RETRACT_ML = line.substring(7).toFloat();
   } else if (startsWith("OFFSET ")) {
     STARTUP_OFFSET_ML = line.substring(7).toFloat();
   } else if (startsWith("RETRACT ")) {
@@ -578,7 +599,8 @@ void handleSerial() {
     Serial.print(F("CAL_FACTOR="));        Serial.println(CAL_FACTOR, 4);
     Serial.print(F("DWELL_S="));           Serial.println(DWELL_S);
     Serial.print(F("RETRACT_MM="));        Serial.println(RETRACT_MM, 3);
-    Serial.print(F("MAX_RETRACT_PCT="));   Serial.println(MAX_RETRACT_PCT, 1);
+    Serial.print(F("RETRACT_PCT="));       Serial.println(RETRACT_PCT, 1);
+    Serial.print(F("MAX_RETRACT_ML="));    Serial.println(MAX_RETRACT_ML, 2);
     Serial.print(F("STARTUP_OFFSET_ML=")); Serial.println(STARTUP_OFFSET_ML, 3);
     Serial.print(F("STEPS_PER_REV="));     Serial.println(STEPS_PER_REV);
     Serial.print(F("LEADSCREW_LEAD_MM=")); Serial.println(LEADSCREW_LEAD_MM, 3);
@@ -588,7 +610,7 @@ void handleSerial() {
     Serial.print(F("LIMIT_RET(D5)="));     Serial.println(digitalRead(PIN_LIMIT_RET) == LOW ? "TRIGGERED" : "open");
     Serial.println(F("----------------"));
   } else {
-    Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, DWELL <s>, RETMM <mm>, RETPCT <pct>, OFFSET <ml>, GO, HOME, PURGE <ml>, RETRACT <ml>, STOP, RESUME, RESET"));
+    Serial.println(F("Unknown cmd. Try: STATUS, V <ml>, SEG <ml>, WAIT <s>, RPM <rpm>, CAL <x>, DWELL <s>, RETMM <mm>, RETPCT <pct>, RETMAX <ml>, OFFSET <ml>, GO, HOME, PURGE <ml>, RETRACT <ml>, STOP, RESUME, RESET"));
   }
 
   Serial.println(F("OK"));
